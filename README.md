@@ -5,11 +5,9 @@ This repository contains implementations of randomized quasi-Monte Carlo (RQMC) 
 The implementation is in the Python programming language and the notation in the code is consistent with the following works:
 
 - [Chiheb Ben Hammouda and Truong Ngoc Nguyen.
-*Single- and Multi-Level Fourier-RQMC Methods for Multivariate Shortfall Risk*  
-  (arXiv preprint)](https://arxiv.org/abs/2602.06424)
+Single- and Multi-Level Fourier-RQMC Methods for Multivariate Shortfall Risk 
+  (arXiv preprint).](https://arxiv.org/abs/2602.06424)
 
-
----
 
 In case of use of the code, please cite us by mentioning the webpage containing the code and adding the following references to your work:
 
@@ -21,5 +19,6 @@ In case of use of the code, please cite us by mentioning the webpage containing 
   year={2026}
 }
 }
+
 
 
