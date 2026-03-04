@@ -1,4 +1,4 @@
-# RQMC for effcient computation of MSRM
+# RQMC-for-Efficient-Fourier-Computation-of-Multivariate-Shortfall-Risk 
 
 This repository contains implementations of randomized quasi-Monte Carlo (RQMC) methods with Fourier transform within both single-level and multilevel frameworks for exponential and QPC loss functions under Gaussian and normal inverse Gaussian (NIG) loss vectors.---
 
@@ -19,6 +19,7 @@ In case of use of the code, please cite us by mentioning the webpage containing 
   year={2026}
 }
 }
+
 
 
 
