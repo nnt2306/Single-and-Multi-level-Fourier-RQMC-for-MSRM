@@ -1,6 +1,6 @@
 # RQMC-for-Efficient-Fourier-Computation-of-Multivariate-Shortfall-Risk 
 
-This repository contains implementations of randomized quasi-Monte Carlo (RQMC) methods with Fourier transform within both single-level and multilevel frameworks for exponential and QPC loss functions under Gaussian and normal inverse Gaussian (NIG) loss vectors.---
+This repository contains implementations of randomized quasi-Monte Carlo (RQMC) methods with Fourier transform within both single-level and multilevel frameworks for exponential and QPC loss functions under Gaussian and normal inverse Gaussian (NIG) loss vectors.
 
 The implementation is in the Python programming language and the notation in the code is consistent with the following works:
 
@@ -18,7 +18,7 @@ In case of use of the code, please cite us by mentioning the webpage containing 
   journal={arXiv preprint arXiv:2602.06424},
   year={2026}
 }
-}
+
 
 
 
