@@ -228,14 +228,14 @@ class RQMC_CV_Fou_MN_expo(CommonLossFunctionAbs):
             if K is None:
                 continue
             rec = self._history_1d[key_1d]  # defaultdict provides the dict
-            rec["K"].append(self._last_K1.get(key_1d))
+            rec["K"].append(-self._last_K1.get(key_1d))
         # ---- 2D (h) ----
         # keys are (i, j, sx, sy) with i<j and sx,sy ∈ {True, False}
         for key_2d, K_vec in self._last_K2.items():
             if K_vec is None:
                 continue
             rec = self._history_2d[key_2d]
-            rec["K"].append(self._last_K2.get(key_2d))
+            rec["K"].append(-self._last_K2.get(key_2d))
     
     
     # Adaptive choice of Sobol sample size.
@@ -613,7 +613,7 @@ class RQMC_CV_Fou_MN_expo(CommonLossFunctionAbs):
             qmc_seq=qmc_seq_1D,
         )
         val = coef * est
-        
+        V_list = V_list * coef
 
         if hess_comp:
             return val
@@ -767,6 +767,7 @@ class RQMC_CV_Fou_MN_expo(CommonLossFunctionAbs):
         )
 
         val_2D = coef * est
+        V_list = V_list * coef
 
         if hess_comp:
             return val_2D

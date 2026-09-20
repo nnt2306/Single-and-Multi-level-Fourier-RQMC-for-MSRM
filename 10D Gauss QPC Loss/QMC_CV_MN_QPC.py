@@ -232,12 +232,18 @@ class RQMC_CV_Fou_MN_qpc(CommonLossFunctionAbs):
         self._accum_jac       = None
         self._jac_components = []  
         self._pending_jac = None
+        self._pending_jac = None
+        self._jac_cov_history = []
+        self._pending_jac_cov = None
+
 
         # Memoized objective / gradient values.
         self._last_loss_m = None
         self._last_loss_val = None
         self._last_jac_m = None
         self._last_jac_val = None
+        self._last_jac_cov = None
+
         
         super().__init__(len(v_mu), c)
            
@@ -250,21 +256,21 @@ class RQMC_CV_Fou_MN_qpc(CommonLossFunctionAbs):
         for loss_name in ("g","f"):
             for i in range(d):
                 rec = self._history_1d[loss_name][i]
-                rec["K"].append(self._last_K1[loss_name][i])
+                rec["K"].append(-self._last_K1[loss_name][i])
 
         if self._alpha:
             for loss_name in ("h","l"):
                 for key in self._last_K2[loss_name]:
                     rec = self._history_2d[loss_name][key]
-                    rec["K"].append(self._last_K2[loss_name][key])
+                    rec["K"].append(-self._last_K2[loss_name][key])
                    
     # Adaptive choice of Sobol sample size.
-    def _divide_sobol(self,mult_factor ,grad = False):
+    def _divide_sobol(self,mult_factor ,grad = False,min_points = 1):
         """Scale Sobol sample size for loss or gradient estimators with lower bound 1."""
         if grad:
-            self._N_current_grad= max(int(self._N_current_grad * mult_factor),1)
+            self._N_current_grad= max(int(self._N_current_grad * mult_factor),min_points)
         else:
-            self._N_current_loss= max(int(self._N_current_loss * mult_factor),1)
+            self._N_current_loss= max(int(self._N_current_loss * mult_factor),min_points)
 
         
     # QMC sequence by dimension (1D/2D) for component integrands.
@@ -701,6 +707,7 @@ class RQMC_CV_Fou_MN_qpc(CommonLossFunctionAbs):
         )
 
         val = coef*est
+        V_list_1D = V_list_1D * coef
 
         if loss_name == "hess_1D":
             return val
@@ -853,6 +860,7 @@ class RQMC_CV_Fou_MN_qpc(CommonLossFunctionAbs):
         )
 
         val_2D = coef * est
+        V_list_2D = V_list_2D * coef
 
         if loss_name == "hess_2D":
             return val_2D
@@ -950,6 +958,10 @@ class RQMC_CV_Fou_MN_qpc(CommonLossFunctionAbs):
             if commit:
                 self._accum_jac = jac_val.copy()
                 self._prev_m_jac = m.copy()
+                if self._last_jac_cov is not None:
+                    self._pending_jac_cov = (
+                        self._last_jac_cov.copy()
+                    )
             return jac_val
 
         def _baseline_jac(m_):
@@ -969,6 +981,11 @@ class RQMC_CV_Fou_MN_qpc(CommonLossFunctionAbs):
                             samples_jac[:, i] += self._alpha * vec_l
 
             self._jac_components = [samples_jac]
+            self._jac_cov_history= [np.cov(
+                                    samples_jac,
+                                    rowvar=False,
+                                    ddof=1,
+                                )]       
        
             return jac
 
@@ -998,11 +1015,19 @@ class RQMC_CV_Fou_MN_qpc(CommonLossFunctionAbs):
                         samples[:, i] += self._alpha * vec_l
 
         jac_val = self._accum_jac + delta
+        increment_cov = np.cov(
+                        samples,
+                        rowvar=False,
+                        ddof=1,
+                    )
+        
 
         if commit:
             self._accum_jac = jac_val.copy()
             self._prev_m_jac = m.copy()
             self._pending_jac = samples
+            self._pending_jac_cov = increment_cov.copy()
+
 
         self._last_jac_m = key
         self._last_jac_val = np.array(jac_val, copy=True)
@@ -1013,18 +1038,43 @@ class RQMC_CV_Fou_MN_qpc(CommonLossFunctionAbs):
     # Statistical error components
     # ============================================================================
     # Gradient-variance component of sandwich covariance V.
-    def shortfall_risk_jac_var(self, loc_index = 0,per_comp = False):
-        """Return covariance estimate of Jacobian RQMC samples."""
-        comps = self._jac_components
-        if not comps:
-            raise RuntimeError("shortfall_risk_jac_var called before any gradient components were recorded")
+    def shortfall_risk_jac_var(self, loc_index=None):
+        """
+        If loc_index is None, return the latest covariance matrix.
 
-        self._var_per_comp = [np.cov(comp, rowvar=False, ddof=1) for comp in comps]
-        var_sum = np.sum( self._var_per_comp[int(loc_index):], axis=0)
+        If loc_index is an integer, sum covariance matrices from that
+        index onward.
 
-        if per_comp:
-            return self._var_per_comp
-        return var_sum
+        If loc_index is a slice, sum the covariance matrices selected
+        by that slice.
+        """
+        covariances = list(self._jac_cov_history)
+
+        if self._pending_jac_cov is not None:
+            covariances.append(
+                self._pending_jac_cov.copy()
+            )
+
+        if not covariances:
+            raise RuntimeError(
+                "shortfall_risk_jac_var was called before "
+                "a Jacobian covariance was computed."
+            )
+
+        # Return the latest covariance matrix
+        if loc_index is None:
+            return covariances[-1]
+
+        # Select covariance matrices
+        
+        start = int(loc_index)
+
+        
+
+        selected = covariances[start:]
+
+        # Sum selected covariance matrices
+        return np.sum(selected, axis=0)
     
     # Inverse Hessian component of sandwich covariance V.
 
@@ -1050,7 +1100,7 @@ class RQMC_CV_Fou_MN_qpc(CommonLossFunctionAbs):
         d = len(m)
         var_jac = self.shortfall_risk_jac_var(loc_index = loc_index)
         inv_H = self.shortfall_risk_hess_inv(m)
-        var_sol = inv_H @ var_jac @ inv_H  
+        var_sol = inv_H @ var_jac @ inv_H .T 
 
         C_alpha = norm.ppf(1 - alpha_conf / 2)
 

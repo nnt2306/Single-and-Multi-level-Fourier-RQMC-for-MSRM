@@ -345,13 +345,13 @@ class RQMC_Fou_NIG_qpc(CommonLossFunctionAbs):
         for loss_name in ("g","f"):
             for i in range(d):
                 rec = self._history_1d[loss_name][i]
-                rec["K"].append(self._last_K1[loss_name][i])
+                rec["K"].append(-self._last_K1[loss_name][i])
 
         if self._alpha:
             for loss_name in ("h","l"):
                 for key in self._last_K2[loss_name]:
                     rec = self._history_2d[loss_name][key]
-                    rec["K"].append(self._last_K2[loss_name][key])
+                    rec["K"].append(-self._last_K2[loss_name][key])
 
     # QMC sequence by dimension (1D/2D) for component integrands.
 
@@ -842,6 +842,7 @@ class RQMC_Fou_NIG_qpc(CommonLossFunctionAbs):
         )
 
         val = coef*est
+        V_list_1D = V_list_1D * coef
 
         if loss_name == "hess_1D":
             return val
@@ -948,6 +949,7 @@ class RQMC_Fou_NIG_qpc(CommonLossFunctionAbs):
         )
         
         val_2D = coef  * est
+        V_list_2D = V_list_2D * coef
 
         if loss_name == "hess_2D":
             return val_2D

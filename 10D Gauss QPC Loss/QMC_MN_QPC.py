@@ -205,9 +205,10 @@ class RQMC_Fou_MN_qpc(CommonLossFunctionAbs):
                 self._sigma_trans_2D[(j, i)] = mat[np.ix_(swap, swap)]
                 self._L_2D[(j, i)] = chol[np.ix_(swap, swap)]
        
-
     
         self._jac_components = [] 
+        self._jac_cov_history = []
+        self._pending_jac_cov = None
 
         super().__init__(len(v_mu), c)        
 
@@ -219,13 +220,13 @@ class RQMC_Fou_MN_qpc(CommonLossFunctionAbs):
         for loss_name in ("g","f"):
             for i in range(d):
                 rec = self._history_1d[loss_name][i]
-                rec["K"].append(self._last_K1[loss_name][i])
+                rec["K"].append(-self._last_K1[loss_name][i])
 
         if self._alpha:
             for loss_name in ("h","l"):
                 for key in self._last_K2[loss_name]:
                     rec = self._history_2d[loss_name][key]
-                    rec["K"].append(self._last_K2[loss_name][key])
+                    rec["K"].append(-self._last_K2[loss_name][key])
 
     # QMC sequence by dimension (1D/2D) for component integrands.
 
@@ -629,6 +630,7 @@ class RQMC_Fou_MN_qpc(CommonLossFunctionAbs):
         )
         
         val = coef*est
+        V_list_1D = V_list_1D * coef
 
         if loss_name == "hess_1D":
             return val
@@ -732,6 +734,7 @@ class RQMC_Fou_MN_qpc(CommonLossFunctionAbs):
         )
 
         val_2D = coef * est
+        V_list_2D = V_list_2D * coef
 
         if loss_name == "hess_2D":
             return val_2D
@@ -788,7 +791,12 @@ class RQMC_Fou_MN_qpc(CommonLossFunctionAbs):
                         jac[i] += self._alpha * val_l
                         samples_jac[:,i] += self._alpha * vec_l
 
-        self._pending_jac = samples_jac              
+        self._pending_jac = samples_jac 
+        self._pending_jac_cov = np.cov(
+                    samples_jac,
+                    rowvar=False,
+                    ddof=1,
+                )                 
         return jac
         
     
@@ -797,18 +805,28 @@ class RQMC_Fou_MN_qpc(CommonLossFunctionAbs):
     # ============================================================================
     # Gradient-variance component of sandwich covariance V.
 
-    def shortfall_risk_jac_var(self,per_comp = False):
-        """Return covariance estimate of Jacobian RQMC samples."""
-        comps = self._jac_components
-        if not comps:
-            raise RuntimeError("shortfall_risk_jac_var called before any gradient components were recorded")
-       
-        self._var_per_comp = [np.cov(comp, rowvar=False, ddof=1) for comp in comps]
+    def shortfall_risk_jac_var(self, per_iteration=False):
+        """
+        Return the sample covariance matrix of the Jacobian contributions.
 
-        if per_comp:
-            return self._var_per_comp
-    
-        return self._var_per_comp[-1]
+        If per_iteration=True, return the covariance history.
+        Otherwise, return the latest covariance matrix.
+        """
+        if not self._jac_cov_history:
+            if self._pending_jac_cov is not None:
+                if per_iteration:
+                    return [self._pending_jac_cov.copy()]
+                return self._pending_jac_cov.copy()
+
+            raise RuntimeError(
+                "shortfall_risk_jac_var was called before "
+                "a Jacobian covariance was computed."
+            )
+
+        if per_iteration:
+            return self._jac_cov_history
+
+        return self._jac_cov_history[-1]
     
     # Inverse Hessian component of sandwich covariance V.
 

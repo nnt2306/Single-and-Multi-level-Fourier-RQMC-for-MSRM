@@ -196,14 +196,14 @@ class RQMC_Fou_MN_expo(CommonLossFunctionAbs):
             if K is None:
                 continue
             rec = self._history_1d[key_1d]  # defaultdict provides the dict
-            rec["K"].append(self._last_K1.get(key_1d))
+            rec["K"].append(-self._last_K1.get(key_1d))
         # ---- 2D (h) ----
         # keys are (i, j, sx, sy) with i<j and sx,sy ∈ {True, False}
         for key_2d, K_vec in self._last_K2.items():
             if K_vec is None:
                 continue
             rec = self._history_2d[key_2d]
-            rec["K"].append(self._last_K2.get(key_2d))
+            rec["K"].append(-self._last_K2.get(key_2d))
             
     # QMC sequence cache by dimension (1D/2D) for component integrands.
     def _get_cached_sobol(self, N, m, multi_dim=False, seed_start=None):
@@ -538,6 +538,7 @@ class RQMC_Fou_MN_expo(CommonLossFunctionAbs):
         )
         self._last_K1[(idx, bool(sign))] = K_1D
         val = coef * est
+        V_list = V_list * coef
 
         self._cache_1d_val[key] = val
         self._cache_1d_V_list[key] = V_list
@@ -648,6 +649,7 @@ class RQMC_Fou_MN_expo(CommonLossFunctionAbs):
         self._last_K2[key_hist] = K_2D
     
         val_2D = coef * est
+        V_list = V_list * coef
         self._cache_2d_val[key] = val_2D
         self._cache_2d_V_list[key] = V_list
 
