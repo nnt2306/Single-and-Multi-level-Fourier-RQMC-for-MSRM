@@ -146,11 +146,12 @@ class MC_Fou_MN_qpc(CommonLossFunctionAbs):
         self,
         v_mu,
         v_sigma,
-        N_mc = 1000,
+        N_mc = 64,
         alpha=0,
         c=None,
         epsilon =1,
         fix_damping = False,
+        seed = 0,
     ):
         """
         Initialize the single-level MC Fourier solver for QPC.
@@ -179,6 +180,9 @@ class MC_Fou_MN_qpc(CommonLossFunctionAbs):
   
 
         
+        self._seed = seed
+
+
         self._N_mc= int(N_mc)
 
         d = len(self._v_mu)
@@ -202,26 +206,14 @@ class MC_Fou_MN_qpc(CommonLossFunctionAbs):
     loss: {i: None for i in range(d)}
     for loss in ("g","f","hess_1D")
 }
-        self._last_time_root1 = {
-            loss: {i: None for i in range(d)}
-            for loss in ("g","f")
-        }
-        self._last_err1 = {
-            loss: {i: None for i in range(d)}
-            for loss in ("g","f")
-}
-        self._last_time_Vlist_1 = {
-            loss: {i: None for i in range(d)}
-            for loss in ("g","f")
-}
 
         self._history_1d = {
             "g": {
-                i: {"K": [], "time_root": [], "mc_stat_err": [],"value_list":[]}
+                i: {"K": []}
                 for i in range(d)
             },
             "f": {
-                i: {"K": [], "time_root": [], "mc_stat_err": [],"value_list":[]}
+                i: {"K": []}
                 for i in range(d)
             },
         }
@@ -233,28 +225,15 @@ class MC_Fou_MN_qpc(CommonLossFunctionAbs):
             loss: {(i,j): None for i in range(d) for j in range(i+1,d)}
             for loss in ("h","l","hess_2D")
         }
-        self._last_time_root2 = {
-            loss: {(i,j): None for i in range(d) for j in range(i+1,d)}
-            for loss in ("h","l")
-        }
-        self._last_err2 = {
-            loss: {(i,j): None for i in range(d) for j in range(i+1,d)}
-            for loss in ("h","l")
-        }
-
-        self._last_time_Vlist_2 = {
-            loss: {(i,j): None for i in range(d) for j in range(i+1,d)}
-            for loss in ("h","l")
-        }
 
         self._history_2d = {
             "h": {
-                (i, j): {"K": [], "time_root": [], "time_int": [], "mc_stat_err": [],"value_list":[]}
+                (i, j): {"K": []}
                 for i in range(d)
                 for j in range(i + 1, d)
             },
             "l": {
-                (i, j): {"K": [], "time_root": [], "time_int": [], "mc_stat_err": [],"value_list":[]}
+                (i, j): {"K": []}
                 for i in range(d)
                 for j in range(i + 1, d)
             },
@@ -267,7 +246,7 @@ class MC_Fou_MN_qpc(CommonLossFunctionAbs):
         self._cache_2d_V_list = {}
 
         self._mc_points =generate_mc_points(
-                    N=self._N_mc, seed=123
+                    N=self._N_mc, seed=self._seed
                 )
     
         self._jac_components = []
@@ -296,7 +275,9 @@ class MC_Fou_MN_qpc(CommonLossFunctionAbs):
                 self._L_2D[(i, j)] = chol
 
                 self._sigma_trans_2D[(j, i)] = mat[np.ix_(swap, swap)]
-                self._L_2D[(j, i)] = chol[np.ix_(swap, swap)]
+                self._L_2D[(j, i)] = np.linalg.cholesky(
+                    self._sigma_trans_2D[(j, i)]
+                )
 
         # ---------------------------------------------------------------------------
         # Precomputed normal transforms and importance-sampling weights.
@@ -403,17 +384,21 @@ class MC_Fou_MN_qpc(CommonLossFunctionAbs):
     # Domain-transformed covariance used for IS sampling.
     # ---------------------------------------------------------------------------
 
-    def _rescale_cov(self,Sigma_block):
-        """Return epsilon-scaled inverse covariance (scalar for 1D, matrix for 2D)."""
-        Sigma_block = np.atleast_2d(Sigma_block)
-        if Sigma_block.shape == (1, 1):
-            sig_scale = self._epsilon * Sigma_block
-            sig_tildle = np.linalg.inv(sig_scale)
-            return float(sig_tildle[0,0])
-        else:
-            sig_scale = self._epsilon * Sigma_block
-            sig_tildle = np.linalg.inv(sig_scale)
-        return sig_tildle
+    def record_qmc_stats(self):
+        """Store selected damping parameters K in history trackers."""
+        d = len(self._current_m)
+
+        # 1-D terms
+        for loss_name in ("g","f"):
+            for i in range(d):
+                rec = self._history_1d[loss_name][i]
+                rec["K"].append(-self._last_K1[loss_name][i])
+
+        if self._alpha:
+            for loss_name in ("h","l"):
+                for key in self._last_K2[loss_name]:
+                    rec = self._history_2d[loss_name][key]
+                    rec["K"].append(-self._last_K2[loss_name][key])
 
 
     
@@ -441,12 +426,32 @@ class MC_Fou_MN_qpc(CommonLossFunctionAbs):
 
         raise ValueError(f"Unknown loss name {name!r}")
 
+    def _rescale_cov(self,Sigma_block):
+        Sigma_block = np.atleast_2d(Sigma_block)
+        if Sigma_block.shape == (1, 1):
+            sig_scale = self._epsilon * Sigma_block
+            sig_tildle = np.linalg.inv(sig_scale)
+            return float(sig_tildle[0,0])
+        else:
+            sig_scale = self._epsilon * Sigma_block
+            sig_tildle = np.linalg.inv(sig_scale)
+        return sig_tildle
+
     # ---------------------------------------------------------------------------
     # Adaptive damping selection for component integrands.
     # ---------------------------------------------------------------------------
 
     def _select_K(self, loss_name,m_curr, idx1=None, idx2=None):
+
         """Select adaptive damping K for a 1D or 2D component family."""
+
+        if loss_name == "hess_2D_boundary":
+
+            first, elapsed = self._select_K(
+                "f", float(m_curr[0]), idx1=idx1
+            )
+            return np.array([first, 0.0]), elapsed
+
 
         # 1D branch (warm start + constrained optimization).
         if idx1 is not None and idx2 is None:
@@ -481,7 +486,8 @@ class MC_Fou_MN_qpc(CommonLossFunctionAbs):
                 bounds = bnds
             )
         
-            K0 = float(res.x) 
+            K0 = float(res.x.item())
+
             # Feasibility guard.
             if K0 > 0:
                 pass
@@ -489,6 +495,7 @@ class MC_Fou_MN_qpc(CommonLossFunctionAbs):
                 K0 = x0
                 
             return K0
+
         # 2D branch (pairwise component).
         if idx1 is not None and idx2 is not None:
             i,j = (idx1,idx2) if idx1<idx2 else (idx2,idx1)
@@ -521,6 +528,7 @@ class MC_Fou_MN_qpc(CommonLossFunctionAbs):
                 bounds = bnds
             )
             
+
             K0_vec = res.x.copy()
             # Feasibility guard.
             if np.all(K0_vec > 0):
@@ -533,6 +541,7 @@ class MC_Fou_MN_qpc(CommonLossFunctionAbs):
             
 
             return K0_vec
+
 
     # ---------------------------------------------------------------------------
     # Log-transformed loss and CF terms used in damping optimization.
@@ -744,19 +753,19 @@ class MC_Fou_MN_qpc(CommonLossFunctionAbs):
         elif loss_name == "hess_1D":
             coef = self._coeff_f
 
-
         if key_1D in self._cache_1d_val:
             return self._cache_1d_val[key_1D],self._cache_1d_V_list[key_1D]
 
         # Select damping for the current step.
         if self._fix_damp:
             if key_damp_1d in self._cache_1d_K:
-                K_1D= self._cache_1d_K[key_damp_1d]
+                K_1D = self._cache_1d_K[key_damp_1d]
             else:
                 K_1D = self._select_K(loss_name, m_val, idx1=idx)
                 self._cache_1d_K[key_damp_1d] = K_1D
         else:
             K_1D = self._select_K(loss_name, m_val, idx1=idx)
+
         U_1D = self._transformed_1d[idx,:]
         importance_weights = self._weights_1d[idx,:]
         cf_values = self._get_cf_1d(idx, K_1D)
@@ -777,16 +786,15 @@ class MC_Fou_MN_qpc(CommonLossFunctionAbs):
             )
 
 
-        val = np.exp(-K_1D *m_val) * coef * est
-        V_list_1D = np.exp(-K_1D *m_val)  * V_est_1D
+        scale = np.exp(-K_1D * m_val) * coef
+        val = scale * est
+        V_list_1D = scale * V_est_1D
 
         if loss_name == "hess_1D":
             return val
 
 
         self._last_K1[loss_name][idx]      = K_1D
-        self._last_time_Vlist_1[idx] = V_list_1D
-        
         self._cache_1d_val[key_1D] = val
         self._cache_1d_V_list[key_1D] = V_list_1D
 
@@ -867,14 +875,28 @@ class MC_Fou_MN_qpc(CommonLossFunctionAbs):
         
         return phase * cf_values / (ui_K0 * ui_K1)
 
+    def hess_2D_boundary_fourier_integrand_vec(
+        self, u, v, idx1, idx2, x, y, K, cf_values=None
+    ):
+        '''Intergrand for boundary correction term'''
+        ui_K0 = u + 1j * K[0]
+        if cf_values is None:
+            cf_values = self.char_function(
+                np.stack([ui_K0, v], axis=-1), idx1, idx2
+            )
+        phase = np.exp(1j * (u * x + v * y))
+        return phase * cf_values / ui_K0**2
+
+
     def _compute_2d(self, loss_name, i, j, m_val):
         """
         Compute one 2D component family for pair (i, j).
 
-        loss_name in {"h", "l", "hess_2D"}:
+        loss_name in {"h", "l", "hess_2D","hess_2D_boundary"}:
         - h: 2D loss component
         - l: 2D gradient component
         - hess_2D: 2D Hessian helper
+        - hess_2D_boundary: 2D Hessian for boundary correction term 
         """
         m_val_2D = m_val[[i,j]]
         key = (i,j)
@@ -890,15 +912,22 @@ class MC_Fou_MN_qpc(CommonLossFunctionAbs):
         
         
         key_mc = key
+
+        if loss_name == 'hess_2D_boundary':
+            indic_K = 'hess_2D'
+        else:
+            indic_K = loss_name
+
         # Select damping for the current step.
         if self._fix_damp:
             if key_damp_2d in self._cache_2d_K:
-                K_2D = self._cache_2d_K[key_damp_2d]
+                K_2D= self._cache_2d_K[key_damp_2d]
             else:
-                K_2D = self._select_K(loss_name, m_val_2D, idx1=i, idx2=j)
+                K_2D= self._select_K(loss_name =  indic_K,m_curr = m_val_2D, idx1=i, idx2=j)
                 self._cache_2d_K[key_damp_2d] = K_2D
         else:
-            K_2D = self._select_K(loss_name, m_val_2D, idx1=i, idx2=j)
+            K_2D= self._select_K(loss_name =  indic_K, m_curr = m_val_2D, idx1=i, idx2=j)
+
 
         U_2D = self._transformed_2d[
             key_mc
@@ -935,12 +964,17 @@ class MC_Fou_MN_qpc(CommonLossFunctionAbs):
         scale = self._coeff_hl * np.exp(-sum_Km)
         val_2D = scale * est
         V_list_2D = scale * V_est_2D
+
         if loss_name == "hess_2D":
             return val_2D
 
-        self._last_K2[loss_name][key_sort]   = K_2D if i<j else K_2D[::-1]
-        self._last_time_Vlist_2[loss_name][key_sort]    = V_list_2D
+        if loss_name == 'hess_2D_boundary':
+            Km_first = K_2D[0]*m_val[0]
+            val_bound_2d = np.exp(-Km_first) * self._coeff_hl * est
+            return val_bound_2d
+        
 
+        self._last_K2[loss_name][key_sort]   = K_2D if i<j else K_2D[::-1]
         self._cache_2d_val[cache_key] = val_2D
         self._cache_2d_V_list[cache_key] = V_list_2D
         
@@ -951,6 +985,36 @@ class MC_Fou_MN_qpc(CommonLossFunctionAbs):
     # Aggregation of all Fourier components
     # ============================================================================
     # Loss aggregation: E[l(X - m)] from 1D and 2D components.
+
+    def loss_derivative_samples(self, m):
+        """Paired loss/positive-gradient contributions, shapes (N,) and (N,d)."""
+        m = self._check_argument(m)
+        self._current_m = m.copy()
+        d = len(m)
+
+        loss_samples = np.full(self._N_mc, self.e(m), dtype=float)
+        gradient_samples = np.ones((self._N_mc, d), dtype=float)
+
+        for i in range(d):
+            _, vec_g = self._compute_1d("g", i, m[i])
+            _, vec_f = self._compute_1d("f", i, m[i])
+            loss_samples += 0.5 * vec_g
+            gradient_samples[:, i] += vec_f
+
+            if self._alpha:
+                for j in range(d):
+                    if j != i:
+                        _, vec_l = self._compute_2d("l", j, i, m)
+                        gradient_samples[:, i] += self._alpha * vec_l
+
+        if self._alpha:
+            for i in range(d):
+                for j in range(i + 1, d):
+                    _, vec_h = self._compute_2d("h", i, j, m)
+                    loss_samples += self._alpha * vec_h
+
+        return loss_samples, gradient_samples
+
 
     def shortfall_risk(self, m):
         """Aggregate objective from deterministic term + Fourier loss components."""
@@ -1000,17 +1064,16 @@ class MC_Fou_MN_qpc(CommonLossFunctionAbs):
                         samples_jac[:,i] += self._alpha * vec_l
 
         self._pending_jac = samples_jac.copy() 
-        self._pending_jac_cov = np.cov(
+        self._pending_jac_cov = np.atleast_2d(np.cov(
             samples_jac,
             rowvar=False,
             ddof=1,
-        )             
+        ))
         return jac
         
     # ============================================================================
     # Statistical error components
     # ============================================================================
-    # Gradient-variance component of sandwich covariance V.
 
     def shortfall_risk_jac_var(self, per_iteration=False):
         """
@@ -1037,42 +1100,82 @@ class MC_Fou_MN_qpc(CommonLossFunctionAbs):
 
     # Inverse Hessian component of sandwich covariance V.
 
-    def shortfall_risk_hess_inv(self, m):
-        """Compute inverse Hessian estimate from Fourier Hessian components."""
+    def mean_loss_hessian(self, m):
+        """Mean loss Hessian, including the ordered boundary correction."""
+        m = self._check_argument(m)
+        self._current_m = m.copy()
+        d = len(m)
+        hessian = np.zeros((d, d), dtype=float)
+
+        for i in range(d):
+            value = self._compute_1d("hess_1D", i, m[i])
+
+            hessian[i, i] = value
+
+            if self._alpha:
+                for j in range(d):
+                    if j == i:
+                        continue
+                    cross = self._compute_2d("hess_2D", j, i, m)
+                    boundary = self._compute_2d("hess_2D_boundary", j, i, m)
+                    hessian[i, j] -= self._alpha * cross
+                    hessian[i, i] -= self._alpha * boundary
+
+        return hessian
+
+
+    def gradient_oracle(self, loss_samples, gradient_samples, lam):
+        """One full Lagrangian oracle per MC observation: shape (N,d+1)."""
+        n_samples, d = gradient_samples.shape
+        oracle_samples = np.empty((n_samples, d + 1), dtype=float)
+        oracle_samples[:, :d] = 1.0 - lam * gradient_samples
+        oracle_samples[:, -1] = loss_samples - self.c
+        return oracle_samples
+
+
+    def jacobian_oracle(self, m, lam, mean_gradient):
         d = len(m)
         
 
-        hess = np.zeros((d, d), dtype=float)
+        jacobian = np.zeros((d + 1, d + 1), dtype=float)
+        jacobian[:d, :d] = lam * self.mean_loss_hessian(m)
+        jacobian[:d, -1] = -mean_gradient
+        jacobian[-1, :d] = -mean_gradient
+        return jacobian
 
-        for i in range(d):
-            hess[i, i] = self._compute_1d('hess_1D',i, m[i])
-            for j in range(d):
-                if j != i:
-                    hess[i, j] = self._alpha * self._compute_2d('hess_2D',j, i, m)
 
-        hess_inv = np.linalg.inv(hess)
+    def _oracle_sandwich(self, m, lam):
+        """Full per-observation sandwich; divide by N for estimator covariance."""
+        m = self._check_argument(m)
+        loss_samples, gradient_samples = self.loss_derivative_samples(m)
+        if gradient_samples.shape[0] < 2:
+            raise ValueError("At least two MC observations are required.")
 
-        return hess_inv
+        oracle_samples = self.gradient_oracle(loss_samples, gradient_samples, lam)
+        oracle_covariance = np.cov(oracle_samples, rowvar=False, ddof=1)
+        mean_jacobian = self.jacobian_oracle(
+            m, lam, gradient_samples.mean(axis=0)
+        )
+        left = np.linalg.solve(mean_jacobian, oracle_covariance)
+        return np.linalg.solve(mean_jacobian, left.T).T
 
-    # Maximum diagonal-based CI radius for the solution estimate.
 
-    def statistical_error_sol_MC(self, m, alpha_conf=0.05):
+    def solution_covariance(self, m, lam):
+        """Estimated covariance of (m, lambda), shape (d+1,d+1)."""
+        return self._oracle_sandwich(m, lam) / self._N_mc
+
+
+    def stat_err_full(self, m, lam, alpha_conf=0.05):
+        """Marginal confidence half-widths for the allocation components."""
+        covariance = self.solution_covariance(m, lam)
+        critical_value = norm.ppf(1.0 - alpha_conf / 2.0)
+        errors = critical_value * np.sqrt(np.diag(covariance)[:self._dim])
+        return float(errors.max())
+
+
+    def statistical_error_sol_MC(self, m, lam, alpha_conf=0.05):
         """Return the maximum coordinate-wise confidence radius for the solution."""
-        d = len(m)
-        var_jac = self.shortfall_risk_jac_var()
-        inv_H = self.shortfall_risk_hess_inv(m)
-        var_sol = inv_H @ var_jac @ inv_H.T
-
-        C_alpha = norm.ppf(1 - alpha_conf / 2)
-
-        MC_stat_err = []
-
-        for i in range(d):
-            std_i = np.sqrt(var_sol[i, i])
-            mc_err = C_alpha * std_i / np.sqrt(self._N_mc)
-            MC_stat_err.append(mc_err)
-
-        return np.nanmax(MC_stat_err)
+        return self.stat_err_full(m, lam, alpha_conf=alpha_conf)
 
 # ============================================================================
 # End of module

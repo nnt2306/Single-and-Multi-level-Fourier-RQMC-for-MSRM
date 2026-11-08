@@ -1,5 +1,5 @@
-import sys
 import numpy as np
+import time
 import qmcpy
 from scipy.stats import norm
 from scipy.optimize import minimize, Bounds
@@ -8,8 +8,9 @@ from scipy.linalg import solve_triangular
 from functools import partial
 from collections import defaultdict
 
-path_pjt = "/Users/Nguye071/Documents/GitHub/Single-and-Multi-level-Fourier-RQMC-for-MSRM"
-sys.path.insert(0, path_pjt)
+import logging
+
+logging.basicConfig(level=logging.INFO)
 
 from msra_loss import CommonLossFunctionAbs
 
@@ -139,7 +140,6 @@ class RQMC_CV_Fou_MN_expo(CommonLossFunctionAbs):
         self._history_1d = defaultdict(
             lambda: {"K": []}
         )
-
         self._cache_1d_val = {}
         self._cache_1d_V_list = {}
 
@@ -190,9 +190,11 @@ class RQMC_CV_Fou_MN_expo(CommonLossFunctionAbs):
                 self._sigma_trans_2D[(i, j)] = mat
                 self._L_2D[(i, j)] = chol
 
-                # store reversed view
+                # Factor the reversed covariance to preserve lower triangularity.
                 self._sigma_trans_2D[(j, i)] = mat[np.ix_(swap, swap)]
-                self._L_2D[(j, i)] = chol[np.ix_(swap, swap)]
+                self._L_2D[(j, i)] = np.linalg.cholesky(
+                    self._sigma_trans_2D[(j, i)]
+                )
         
         # ---------------------------------------------------------------------------
         # Set up for difference integrands.
@@ -201,13 +203,16 @@ class RQMC_CV_Fou_MN_expo(CommonLossFunctionAbs):
         # State used for difference-integrand accumulation across iterations.
         self._prev_m_loss       = None
         self._prev_m_jac = None
+        self._cv_history = []
+        self._pending_cv_step = None
+        self._prev_m_cv = None
         
         self._accum_loss      = 0.0
         self._accum_jac       = None
         self._jac_components = []          
         self._pending_jac = None
         
-
+        #  integration counts.
 
         # Memoized objective and gradient at the last queried point.
         self._last_loss_m = None
@@ -236,6 +241,7 @@ class RQMC_CV_Fou_MN_expo(CommonLossFunctionAbs):
                 continue
             rec = self._history_2d[key_2d]
             rec["K"].append(-self._last_K2.get(key_2d))
+
     
     
     # Adaptive choice of Sobol sample size.
@@ -308,10 +314,12 @@ class RQMC_CV_Fou_MN_expo(CommonLossFunctionAbs):
     # ---------------------------------------------------------------------------
     def _select_K_1D(self, idx1, m_curr, side1d=True,m_prev = None):
         """
-        Select 1D damping parameter K under the side constraint.
-
-        side1d=True  -> K > beta
-        side1d=False -> K < beta
+        Unified K-selection for:
+        - 1D:  g_plus (K>beta), g_minus (K<beta)
+        - 2D:  h_plus (K1>beta, K2>beta), h_minus (K1<beta, K2<beta)
+        Returns:
+        (K_scalar, elapsed) if idx1 set and idx2 is None
+        (K_vec[2], elapsed) if idx1 and idx2 set (order matches inputs)
         """
         if m_prev is not None:
            m_curr = m_curr-m_prev
@@ -328,10 +336,10 @@ class RQMC_CV_Fou_MN_expo(CommonLossFunctionAbs):
         # --- 1D branch -----------------------------------------------------------
 
         sigma_i_sc = self._v_sigma[idx1, idx1]
-        lam_da = 0.0 ## Penalizing parameter for boundary-hugging control
-
+        lam_da = 0
 
         def F1(K):
+            # value
             val_loss, _, _ = self._loss_1D_grad_hess(K, side1d)
             val_cf, _, _ = self._log_cf_grad_hess_1d(K, idx1)
             return (
@@ -345,14 +353,14 @@ class RQMC_CV_Fou_MN_expo(CommonLossFunctionAbs):
             # gradient
             _, grad_loss, _ = self._loss_1D_grad_hess(K, side1d)
             _, grad_cf, _ = self._log_cf_grad_hess_1d(K, idx1)
-            return grad_loss + grad_cf + lam_da * K * sigma_i_sc - m_curr  # Penalizing term.
+            return grad_loss + grad_cf + lam_da * K * sigma_i_sc - m_curr
+
 
         bnds = Bounds(lb, ub, keep_feasible=True)
 
         res = minimize(fun=F1, x0=x0, method="SLSQP", jac=G1, bounds=bnds)
-       
 
-        K_sol = float(res.x)
+        K_sol = float(res.x[0])
         ok_1d = (K_sol > self._v_beta) if side1d else (K_sol < self._v_beta)
         # Feasibility guard (stick to side; if not, keep previous x0)
         if not ok_1d:
@@ -360,8 +368,9 @@ class RQMC_CV_Fou_MN_expo(CommonLossFunctionAbs):
 
         return K_sol
 
+
     def _select_K_2d(self, idx1, idx2, m_curr, side2d=(True, True), m_prev = None):
-        """Select 2D damping vector K under per-component side constraints."""
+
         if m_prev is not None:
             m_curr = m_curr-m_prev
         sx, sy = side2d
@@ -388,14 +397,14 @@ class RQMC_CV_Fou_MN_expo(CommonLossFunctionAbs):
             x0_vec = np.array([const if sx else -const, const if sy else -const])
 
         sigma_2d = self._v_sigma[np.ix_([i, j], [i, j])]
-        lam_da = 0.0 ## Penalizing parameter for boundary-hugging control
+        lam_da = 0
 
 
         def F2(K_vec):
             # value
             val_loss, _, _ = self._loss_2D_grad_hess(K_vec, side2d)
             val_cf, _, _ = self._log_cf_grad_hess_2d(K_vec, idx1=i, idx2=j)
-            quad = 0.5 * lam_da * float(K_vec @ (sigma_2d @ K_vec))  # Penalizing term.
+            quad = 0.5 * lam_da * float(K_vec @ (sigma_2d @ K_vec))
             return val_loss + val_cf + quad - float(K_vec @ m_curr)
 
         def G2(K_vec):
@@ -404,6 +413,11 @@ class RQMC_CV_Fou_MN_expo(CommonLossFunctionAbs):
             _, g_cf, _ = self._log_cf_grad_hess_2d(K_vec, idx1=i, idx2=j)
             return g_loss + g_cf + lam_da * (sigma_2d @ K_vec) - m_curr
 
+            # (Optional) Hessian if you switch to trust-constr
+            # def H2(K_vec):
+            #     _, _, h_loss = self._loss_grad_hess_by_name(loss_name, K_vec, idx1=i, idx2=j)
+            #     _, _, h_cf   = self._log_cf_grad_hess_2d(K_vec, idx1=i, idx2=j)
+            #     return h_loss + h_cf + lam_da * sigma_2d
 
         bnds = Bounds(lb, ub, keep_feasible=True)
 
@@ -417,8 +431,15 @@ class RQMC_CV_Fou_MN_expo(CommonLossFunctionAbs):
 
         if not (okx and oky):
             K_vec = x0_vec
+        # Put back in caller’s order
+        '''
+        if i > j:
+            K_vec = K_vec[::-1]
+        '''
+
 
         return K_vec
+
     
     # ---------------------------------------------------------------------------
     # Log-transformed loss and CF terms used in damping optimization.
@@ -533,60 +554,70 @@ class RQMC_CV_Fou_MN_expo(CommonLossFunctionAbs):
 
     
     # 1D component difference-integrand.
-    def g_fourier_integrand(self, u, idx, m_val, K, positive_sign=True, m_prev = None):
+    def _phase_1D(self, u, m_val, K, m_prev=None):
+        if m_prev is None:
+            return np.exp(1j * u * m_val)
+
+        delta = m_val - m_prev
+
+        return (
+            np.exp(1j * u * m_prev)
+            * np.expm1((1j * u - K) * delta)
+    )
+
+
+    def g_fourier_integrand(
+        self, u, idx, m_val, K, positive_sign=True, m_prev=None
+    ):
+        """Integrand for g-term, with outer damping factored out."""
         i = 1j
         ui_K = u + i * K
-        z = -(K-i*u)
-        
-        if m_prev is None:
-            phase = np.exp(z * m_val)
-        else:
-            delta = m_val - m_prev
-            phase = np.exp(z * m_prev) * np.expm1(z * delta)  # stable when delta -> 0
 
+        phase = self._phase_1D(u, m_val, K, m_prev)
         cf = self.char_function(ui_K, idx)
 
         indic = (
-            (K - self._v_beta - u * i) if positive_sign else (self._v_beta - K + u * i)
+            K - self._v_beta - i * u
+            if positive_sign
+            else self._v_beta - K + i * u
         )
-
 
         return phase * cf / indic
 
+
     def _compute_1d(self, idx, m_val, sign=True, m_prev = None,hess_comp = False):
-        """Compute one-sided 1D component value and RQMC shift samples."""
-        
+        """Handles both g/f single‐term and CV‐difference if control_var=True."""
+        # pick integrand & coefficient
+        # key_1D = (loss_name,idx,float(m_val))
         if hess_comp:
             N_current = self._N_fixed
         else:
             N_current = self._N_current
-        
-        key_parts = ["g", bool(sign), float(m_val)]
+
+        key_parts = ["g", idx, bool(sign), float(m_val)]
 
         if m_prev is not None:
             key_parts.append(float(m_prev))
 
-        
+
         key_1D = tuple(key_parts)
         if key_1D in self._cache_1d_val:
             return self._cache_1d_val[key_1D], self._cache_1d_V_list[key_1D]
-        
-        # Select damping for current step.
-        K_1D= self._select_K_1D(idx, m_val,side1d=sign,m_prev = m_prev)
-       
+
+        K_1D = self._select_K_1D(idx, m_val,side1d=sign,m_prev = m_prev)
         m_val_scalar = float(np.asarray(m_val).item())
         if m_prev is None:
             seed_key = (idx, m_val_scalar, None)
         else:
             m_prev_scalar = float(np.asarray(m_prev).item())
             seed_key = (idx, m_val_scalar, m_prev_scalar)
-        
-        # Use independent seeds for 1D component integrands across levels.
-        seed_start = self._sobol_seed_map_1d.get(seed_key) 
+
+        seed_start = self._sobol_seed_map_1d.get(seed_key) # At new keys the seed start always become None
         if seed_start is None:
             seed_start = self._sobol_seed_1d
             self._sobol_seed_map_1d[seed_key] = seed_start
             self._sobol_seed_1d += self._m_shift
+
 
 
         qmc_seq_1D = self._get_cached_sobol(
@@ -594,13 +625,13 @@ class RQMC_CV_Fou_MN_expo(CommonLossFunctionAbs):
             self._m_shift,
             seed_start= seed_start,
         )
-        
+
         coef = self._coeff_1D
 
         integrand_1D = partial(self.g_fourier_integrand, positive_sign=sign, m_prev = m_prev)
-        
 
-        # Estimate one side.
+
+        # Estimate +side
         est, V_list = RQMC_Fourier_1D_MN_vec(
             K_1D,
             idx,
@@ -612,17 +643,23 @@ class RQMC_CV_Fou_MN_expo(CommonLossFunctionAbs):
             integrand_func=integrand_1D,
             qmc_seq=qmc_seq_1D,
         )
-        val = coef * est
-        V_list = V_list * coef
+        anchor = m_val if m_prev is None else m_prev
+        scale = coef * np.exp(-K_1D * anchor)
+
+        val_1D = scale * est
+        V_list_1D = scale * V_list
 
         if hess_comp:
-            return val
-        
-        self._last_K1[(idx, bool(sign))] = K_1D
-        self._cache_1d_val[key_1D] = val
-        self._cache_1d_V_list[key_1D] = V_list
+            return val_1D
 
-        return val, V_list
+        # record history & new K
+        self._last_K1[(idx, bool(sign))] = K_1D
+
+        self._cache_1d_val[key_1D] = val_1D
+        self._cache_1d_V_list[key_1D] = V_list_1D
+
+        return val_1D, V_list_1D
+
 
     def _compute_1d_2side(self, idx, m_val, m_prev=None, hess_comp=False):
         """Sum both 1D sides and aggregate per-shift samples."""
@@ -636,60 +673,75 @@ class RQMC_CV_Fou_MN_expo(CommonLossFunctionAbs):
         return val_pos + val_neg, V_pos + V_neg
 
     # 2D component difference integrands.
-    def h_fourier_integrand(self, u, v, idx1, idx2, x, y, K, positive_sign=(True, True), xy_prev = None
-):
+    def _phase_2D(self, u, v, x, y, K, xy_prev=None):
+        # Accept either a scalar K or a pair.
+        Kx, Ky = np.broadcast_to(
+            np.asarray(K, dtype=float), (2,)
+        )
+
+        if xy_prev is None:
+            return np.exp(1j * (u * x + v * y))
+
+        x_prev, y_prev = xy_prev
+
+        delta = (
+            (1j * u - Kx) * (x - x_prev)
+            + (1j * v - Ky) * (y - y_prev)
+        )
+
+        return (
+            np.exp(1j * (u * x_prev + v * y_prev))
+            * np.expm1(delta)
+        )
+
+
+    def h_fourier_integrand(
+        self, u, v, idx1, idx2, x, y, K,
+        positive_sign=(True, True), xy_prev=None
+    ):
+        """Integrand for h-term, with outer damping factored out."""
         i = 1j
 
-        # Broadcast u and v
-        u = np.asarray(u)
-        v = np.asarray(v)
-        u, v = np.broadcast_arrays(u, v)
+        u, v = np.broadcast_arrays(
+            np.asarray(u), np.asarray(v)
+        )
 
-        # Handle K as scalar or pair
-        K = np.asarray(K)
-        if K.ndim == 0:
-            Kx = Ky = K
-        else:
-            if K.shape[0] != 2:
-                raise ValueError("K must be scalar or length-2 array-like.")
-            Kx, Ky = K[0], K[1]
+        Kx, Ky = np.broadcast_to(
+            np.asarray(K, dtype=float), (2,)
+        )
 
-        # Complex shifts
         ui_K0 = u + i * Kx
         ui_K1 = v + i * Ky
-        z0 = -(K[0] - i * u)
-        z1 = -(K[1] - i * v)
-        
-        if xy_prev is None:
-            phase = np.exp(z0 * x + z1 * y)
-        else:
-            x_prev, y_prev = xy_prev
-            base = np.exp(z0 * x_prev + z1 * y_prev)
-            delta = z0 * (x - x_prev) + z1 * (y - y_prev)
-            phase = base * np.expm1(delta)  # stable even when delta ≈ 0
 
-        # Phase term: exp(-(Kx - i u) x - (Ky - i v) y)
+        phase = self._phase_2D(
+            u, v, x, y, (Kx, Ky), xy_prev
+        )
 
-        # Characteristic function
-        tij = np.stack([ui_K0, ui_K1], axis=-1)        
-        cf  = self.char_function(tij, idx1, idx2)    
+        cf = self.char_function(
+            np.stack([ui_K0, ui_K1], axis=-1),
+            idx1,
+            idx2,
+        )
 
-        # Side selection and component-wise betas
         sx, sy = bool(positive_sign[0]), bool(positive_sign[1])
-        
 
-        s_x = (-i) if sx else (i)          # ±i multiplier
-        s_y = (-i) if sy else (i)
-        b_x = -self._v_beta if sx else self._v_beta   # ±β_i
+        s_x = -i if sx else i
+        s_y = -i if sy else i
+
+        b_x = -self._v_beta if sx else self._v_beta
         b_y = -self._v_beta if sy else self._v_beta
 
-        denom = (s_x * ui_K0 + b_x) * (s_y * ui_K1 + b_y)
+        denom = (
+            (s_x * ui_K0 + b_x)
+            * (s_y * ui_K1 + b_y)
+        )
 
-        return (phase * cf) / denom
+        return phase * cf / denom
+
 
 
     def _compute_2d(self, i, j, m_val, sign2d=(True, True),m_prev = None,hess_comp = False):
-        """Compute one 2D sign-combination value and RQMC shift samples."""
+        """Handles both h/l single‐term and CV‐difference if control_var=True."""
 
         m_val_2D = m_val[[i, j]]
         key_parts = [
@@ -711,18 +763,17 @@ class RQMC_CV_Fou_MN_expo(CommonLossFunctionAbs):
 
         if key_2D in self._cache_2d_val:
             return self._cache_2d_val[key_2D], self._cache_2d_V_list[key_2D]
-        
-        # Select damping for current step.
 
-        K_2D = self._select_K_2d(i, j,m_val_2D,side2d=sign2d,m_prev = m_prev_2D)
+        K_2D= self._select_K_2d(i, j,m_val_2D,side2d=sign2d,m_prev = m_prev_2D)
+        key = (i,j)
 
         key_sort = (i,j) if i<j else (j,i)
-    
+
         if hess_comp:
            N_current = self._N_fixed
         else:
            N_current = self._N_current
-        
+
 
         idx_pair = key_sort
         order = list(idx_pair)
@@ -734,12 +785,11 @@ class RQMC_CV_Fou_MN_expo(CommonLossFunctionAbs):
 
         seed_key = (idx_pair, m_pair_vals, m_prev_pair_vals)
         seed_start = self._sobol_seed_map_2d.get(seed_key)
-        # Use independent seeds for 2D component integrands across levels.
         if seed_start is None:
             seed_start = self._sobol_seed_2d
             self._sobol_seed_map_2d[seed_key] = seed_start
             self._sobol_seed_2d += self._m_shift
-        
+
         qmc_seq_2D = self._get_cached_sobol(
             N_current,
             self._m_shift,
@@ -748,11 +798,13 @@ class RQMC_CV_Fou_MN_expo(CommonLossFunctionAbs):
         )
         
 
+
         coef = self._coeff_2D
 
         integrand_func_2D = partial(self.h_fourier_integrand, positive_sign=sign2d, xy_prev = m_prev_2D)
 
-        est, V_list = RQMC_Fourier_2D_MN_vec(
+
+        est, V_list_2D = RQMC_Fourier_2D_MN_vec(
             K_2D,
             i,
             j,
@@ -765,20 +817,39 @@ class RQMC_CV_Fou_MN_expo(CommonLossFunctionAbs):
             integrand_func=integrand_func_2D,
             qmc_seq_2D=qmc_seq_2D,
         )
+        
 
-        val_2D = coef * est
-        V_list = V_list * coef
+        anchor = (
+            m_val_2D
+            if m_prev_2D is None
+            else m_prev_2D
+        )
+
+        Kx, Ky = np.broadcast_to(
+            np.asarray(K_2D, dtype=float), (2,)
+        )
+
+        scale = coef * np.exp(
+            -Kx * anchor[0]
+            -Ky * anchor[1]
+        )
+
+        val_2D = scale * est
 
         if hess_comp:
             return val_2D
 
+        V_list_2D = scale * V_list_2D
+
+
         key_hist = (min(i, j), max(i, j), bool(sign2d[0]), bool(sign2d[1]))
         self._last_K2[key_hist] = K_2D
-        val_2D = coef * est
-        self._cache_2d_val[key_2D] = val_2D
-        self._cache_2d_V_list[key_2D] = V_list
 
-        return val_2D, V_list
+        self._cache_2d_val[key_2D] = val_2D
+        self._cache_2d_V_list[key_2D] = V_list_2D
+
+        return val_2D, V_list_2D
+
 
     def _compute_2d_2side(self, i, j, m_val, m_prev=None, hess_comp=False):
         """Aggregate all four 2D sign combinations."""
@@ -800,202 +871,285 @@ class RQMC_CV_Fou_MN_expo(CommonLossFunctionAbs):
     # Aggregation all the Fourier components
     # ============================================================================
     # Loss aggregation: E[l(X - m)] from 1D and 2D components.
-    def shortfall_risk(self, m,commit = False):
-        m = self._check_argument(m)
-
-        key = tuple(np.asarray(m, dtype=float))
-
-        if key == self._last_loss_m:
-            val = float(self._last_loss_val)
-            if commit:
-                self._accum_loss = val
-                self._prev_m_loss = m.copy()
-            return val
-
+    def _loss_cv_samples(self, m, m_prev=None):
+        """Loss baseline or CV increment: shape (m_shift,)."""
         d = len(m)
-        
+        samples = np.zeros(self._m_shift, dtype=float)
 
-        def _baseline(m_):
-            g = sum(self._compute_1d_2side(i, m_[i])[0] for i in range(d))
-            h = 0.0
-            if self._alpha:
-                h = sum(
-                    self._compute_2d_2side(i, j, m_)[0]
-                    for i in range(d)
-                    for j in range(i + 1, d)
-                )
-            return self._1_alpha * (g + (self._alpha * h))
-        
-        
-        if self._prev_m_loss is None:
-            val = _baseline(m)
-            
-            if commit:
-                self._accum_loss = float(val)
-                self._prev_m_loss = m.copy()
-            self._last_loss_m = key
-            self._last_loss_val = float(val)
-
-            return float(val)
-        m_prev = self._prev_m_loss
-
-        
-        # 1-D terms
-        delta_g = 0.0
         for i in range(d):
-            val_i, _ = self._compute_1d_2side(i, m[i], m_prev=m_prev[i])
-            delta_g += val_i
-            
-        # 2-D terms
+            prev_i = None if m_prev is None else m_prev[i]
 
-        delta_h = 0.0
+            _, vec = self._compute_1d_2side(
+                i,
+                m[i],
+                m_prev=prev_i,
+                hess_comp=False,
+            )
+            samples += vec
+
         if self._alpha:
             for i in range(d):
-                for j in range(i+1, d):
-                    val_ij, _ = self._compute_2d_2side( i, j, m, m_prev=m_prev)
-                    delta_h += val_ij
+                for j in range(i + 1, d):
+                    _, vec = self._compute_2d_2side(
+                        i,
+                        j,
+                        m,
+                        m_prev=m_prev,
+                        hess_comp=False,
+                    )
+                    samples += self._alpha * vec
 
-        delta = self._1_alpha * (delta_g + (self._alpha * delta_h))
-        val = self._accum_loss + delta
-       
-        if commit:
-            self._accum_loss = val
-            self._prev_m_loss = m.copy()
-    
-        self._last_loss_m = key
-        self._last_loss_val = float(val)
-        return float(val)
-        
-    # Loss gradient aggregation: E[∇l(X - m)] from 1D and 2D components.
-    def shortfall_risk_jac(self, m,commit = False):
-        m = self._check_argument(m)
+        return self._1_alpha * samples
 
+
+    def _gradient_cv_samples(self, m, m_prev=None):
+        """Gradient baseline or CV increment: shape (m_shift, d)."""
         d = len(m)
-        key = tuple(np.asarray(m, dtype=float))
-
-        if key == self._last_jac_m:
-            jac_val = np.array(self._last_jac_val, copy=True)
-            if commit:
-                self._accum_jac = jac_val.copy()
-                self._prev_m_jac = m.copy()
-            return jac_val
-        
-        def _baseline_jac(m_):
-            jac = np.zeros_like(m_, dtype=float)
-            samples_jac = np.zeros((self._m_shift, d), dtype=float)
-    
-            for i in range(d):
-                val,vec = self._compute_1d_2side(i, m_[i])
-                jac[i] = val
-                samples_jac[:,i] = vec
-                if self._alpha:
-                    for j in range(d):
-                        if j != i:
-                            val_l,vec_l = self._compute_2d_2side(j, i, m_)
-                            jac[i] += self._alpha * val_l
-                            samples_jac[:,i] += self._alpha * vec_l
-            samples_jac *= self._1_alpha * self._v_beta
-            self._jac_components = [samples_jac]
-
-            return self._1_alpha * self._v_beta * jac
-        
-        if self._prev_m_jac is None:
-            jac0 = _baseline_jac(m)
-            if commit:
-                self._accum_jac = jac0.copy()
-                self._prev_m_jac = m.copy()
-            
-            self._last_jac_m = key
-            self._last_jac_val = np.array(jac0, copy=True)
-            return jac0
-        
-        m_prev = self._prev_m_jac
-        delta = np.zeros_like(m, dtype=float)
         samples = np.zeros((self._m_shift, d), dtype=float)
 
         for i in range(d):
-            val_f,vec_f = self._compute_1d_2side(i, m[i], m_prev=m_prev[i])
-            delta[i] = val_f
-            samples[:,i] = vec_f
+            prev_i = None if m_prev is None else m_prev[i]
+
+            _, vec = self._compute_1d_2side(
+                i,
+                m[i],
+                m_prev=prev_i,
+                hess_comp=False,
+            )
+            samples[:, i] += vec
+
             if self._alpha:
                 for j in range(d):
-                    if j != i:
-                        val_l,vec_l = self._compute_2d_2side(
-                            j, i, m, m_prev=m_prev
-                        )
-                        delta[i] += self._alpha * val_l
-                        samples[:, i] += self._alpha * vec_l
-        samples *= self._1_alpha * self._v_beta
-        delta *= self._1_alpha * self._v_beta
-        jac_val = self._accum_jac + delta
+                    if j == i:
+                        continue
+
+                    _, vec = self._compute_2d_2side(
+                        j,
+                        i,
+                        m,
+                        m_prev=m_prev,
+                        hess_comp=False,
+                    )
+                    samples[:, i] += self._alpha * vec
+
+        return self._1_alpha * self._v_beta * samples
+
+    def _evaluate_cv_step(self, m, commit=False):
+        """
+        Evaluate the accumulated loss and positive loss gradient.
+
+        Trial:
+            Store one pending baseline/increment without changing history.
+
+        Commit:
+            Append the pending version and update the shared committed point.
+        """
+        m = self._check_argument(m)
+        self._current_m = m.copy()
+
+        m_prev = self._prev_m_cv
+
+        if m_prev is not None and np.array_equal(m, m_prev):
+            # Already committed: do not append the same version twice.
+            self._pending_cv_step = None
+            return float(self._accum_loss), self._accum_jac.copy()
+
+        key = (
+            tuple(m),
+            None if m_prev is None else tuple(m_prev),
+            int(self._N_current),
+            int(self._m_shift),
+        )
+
+        step = self._pending_cv_step
+
+        if step is None or step["key"] != key:
+            step = {
+                "key": key,
+                "m": m.copy(),
+                "m_prev": None if m_prev is None else m_prev.copy(),
+                "N": int(self._N_current),
+                "loss_samples": self._loss_cv_samples(m, m_prev),
+                "gradient_samples": self._gradient_cv_samples(m, m_prev),
+            }
+
+        loss_value = float(
+            self._accum_loss + step["loss_samples"].mean()
+        )
+
+        gradient_value = step["gradient_samples"].mean(axis=0)
+        if self._accum_jac is not None:
+            gradient_value = self._accum_jac + gradient_value
 
         if commit:
-            self._accum_jac = jac_val.copy()
-            self._prev_m_jac = m.copy()
-            self._pending_jac = samples
+            self._cv_history.append(step)
+            self._prev_m_cv = m.copy()
 
-        self._last_jac_m = key
-        self._last_jac_val = np.array(jac_val, copy=True)
-        return jac_val
+            self._accum_loss = loss_value
+            self._accum_jac = gradient_value.copy()
 
+            self._pending_cv_step = None
+        else:
+            # A different trial replaces the previous pending trial.
+            self._pending_cv_step = step
+
+        return loss_value, gradient_value.copy()
+
+    def shortfall_risk(self, m, commit=False):
+        loss_value, _ = self._evaluate_cv_step(m, commit=commit)
+        return loss_value
+    # Gradient-variance component of sandwich covariance V.
+    def shortfall_risk_jac(self, m, commit=False):
+        _, gradient_value = self._evaluate_cv_step(m, commit=commit)
+        return gradient_value
 
     # ============================================================================
     # Statistical error components
     # ============================================================================
-    # Gradient-variance component of sandwich covariance V.
-    def shortfall_risk_jac_var(self,loc_index = 0):
-        comps = self._jac_components
-        if not comps:
-            raise RuntimeError("shortfall_risk_jac_var called before any gradient components were recorded")
 
-        var_per_comp = [np.cov(comp, rowvar=False, ddof=1) for comp in comps]
-        var_sum = np.sum(var_per_comp[loc_index:], axis=0)
+    def oracle_covariance(self, lam, loc_index=0):
         
-        return var_sum
-    
-    # Inverse Hessian component of sandwich covariance V.
-    def shortfall_risk_hess_inv(self, m):
+        versions = list(self._cv_history)
+
+        if self._pending_cv_step is not None:
+            versions.append(self._pending_cv_step)
+
+        if not versions:
+            raise RuntimeError("No CV samples have been computed.")
+
+        if loc_index is None:
+            selected = versions[-1:]
+        elif isinstance(loc_index, slice):
+            selected = versions[loc_index]
+        else:
+            start = int(loc_index)
+
+            if not -len(versions) <= start < len(versions):
+                raise IndexError("Invalid covariance version index.")
+
+            selected = versions[start:]
+
+        if not selected:
+            raise IndexError("The covariance selection is empty.")
+
+        covariances = []
+
+        for step in selected:
+            oracle_samples = self.gradient_oracle(
+                step["loss_samples"],
+                step["gradient_samples"],
+                lam,
+                increment=step["m_prev"] is not None,
+            )
+
+            if oracle_samples.shape[0] < 2:
+                raise ValueError("At least two shifts are required.")
+
+            covariances.append(
+                np.atleast_2d(
+                    np.cov(oracle_samples, rowvar=False, ddof=1)
+                )
+            )
+
+        return np.sum(covariances, axis=0)
+
+    def gradient_oracle(
+        self, loss_samples, gradient_samples, lam, increment=False
+    ):
+        """Baseline or increment oracle samples: shape (S, d+1)."""
+        n_shifts, d = gradient_samples.shape
+
+        oracle_samples = np.empty((n_shifts, d + 1), dtype=float)
+
+        oracle_samples[:, :d] = -lam * gradient_samples
+        oracle_samples[:, -1] = loss_samples
+
+        # Constants occur only in the baseline.
+        if not increment:
+            oracle_samples[:, :d] += 1.0
+            oracle_samples[:, -1] -= self.c
+
+        return oracle_samples
+
+    def mean_loss_hessian(self, m):
+        """Direct mean Hessian at m; no CV accumulation or sample storage."""
+        m = self._check_argument(m)
+        self._current_m = m.copy()
+
         d = len(m)
+
         const_1 = self._1_alpha * self._v_beta**2
-        const_2 = self._alpha * self._v_beta**2 * self._1_alpha
+        const_2 = self._alpha * const_1
 
-        hess = np.zeros((d, d), dtype=float)
-
-        global_comp = 0.0
-        for i in range(d):
-            for j in range(d):
-                if j == i:
-                    continue
-                global_comp += const_2 * self._compute_2d_2side(j, i, m, m_prev = None, hess_comp= True)
+        hessian = np.zeros((d, d), dtype=float)
 
         for i in range(d):
-            hess[i, i] = const_1 * self._compute_1d_2side(i, m[i],m_prev = None, hess_comp= True) + global_comp
-            for j in range(d):
-                if j != i:
-                    hess[i, j] = global_comp
-        hess_inv = np.linalg.inv(hess)
-        return hess_inv
-    
-    # Maximum diagonal-based CI radius for the solution estimate.
-    def statistical_error_sol_RQMC(self, m, alpha_conf=0.05,loc_index = 0):
+            val = self._compute_1d_2side(
+                i, m[i],
+                m_prev=None,
+                hess_comp=True,
+            )
+            hessian[i, i] = const_1 * val
+
+        if self._alpha:
+            for i in range(d):
+                for j in range(i + 1, d):
+                    val = self._compute_2d_2side(
+                        i, j, m,
+                        m_prev=None,
+                        hess_comp=True,
+                    )
+
+                    contribution = const_2 * val
+
+                    hessian[i, i] += contribution
+                    hessian[j, j] += contribution
+                    hessian[i, j] = contribution
+                    hessian[j, i] = contribution
+
+        return hessian
+
+    def jacobian_oracle(self, m, lam, mean_gradient):
+        """Mean oracle Jacobian with respect to (m, lambda)."""
         d = len(m)
-        var_jac = self.shortfall_risk_jac_var(loc_index = loc_index)
-        inv_H = self.shortfall_risk_hess_inv(m)
-        var_sol = inv_H @ var_jac @ inv_H  # (d,d)
+        mean_hessian = self.mean_loss_hessian(m)
 
-        C_alpha = norm.ppf(1 - alpha_conf / 2)
+        jacobian = np.zeros((d + 1, d + 1), dtype=float)
 
-        RQMC_stat_error = []
+        jacobian[:d, :d] = lam * mean_hessian
+        jacobian[:d, -1] = -mean_gradient
+        jacobian[-1, :d] = -mean_gradient
 
-        for i in range(d):
-            std_i = np.sqrt(var_sol[i, i])
-            rqmc_err = C_alpha * std_i / np.sqrt(self._m_shift)
-            RQMC_stat_error.append(rqmc_err)
+        return jacobian
 
-        return np.max(RQMC_stat_error)
+    def stat_err_full(self, m, lam, alpha_conf=0.05, loc_index=0):
+        """Marginal confidence half-widths for allocation components."""
+        m = self._check_argument(m)
+        d = len(m)
 
-        
+        # Full accumulated mean gradient at the requested point.
+        _, mean_gradient = self._evaluate_cv_step(m, commit=False)
 
+        # Covariance is computed per version, then summed.
+        oracle_cov = self.oracle_covariance(
+            lam, loc_index=loc_index
+        )
+
+        mean_jacobian = self.jacobian_oracle(
+            m, lam, mean_gradient
+        )
+
+        left = np.linalg.solve(mean_jacobian, oracle_cov)
+        sandwich = np.linalg.solve(mean_jacobian, left.T).T
+
+        estimator_covariance = sandwich / self._m_shift
+
+        critical_value = norm.ppf(1.0 - alpha_conf / 2.0)
+        errors = critical_value * np.sqrt(
+            np.diag(estimator_covariance)
+        )
+
+        return float(errors.max())
 
 # ============================================================================
 # End of module

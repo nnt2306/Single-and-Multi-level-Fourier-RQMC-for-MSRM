@@ -1,13 +1,10 @@
-import sys
 import numpy as np
+import time
 import qmcpy
 from scipy.stats import norm
 from scipy.optimize import minimize, Bounds
 from scipy.linalg import solve_triangular
 from scipy.special import kv as bessel_func
-
-path_pjt = "/Users/Nguye071/Documents/GitHub/Single-and-Multi-level-Fourier-RQMC-for-MSRM"
-sys.path.insert(0, path_pjt)
 from msra_loss import CommonLossFunctionAbs
 
 # Support function to derive RQMC estimate for NIG case
@@ -194,6 +191,7 @@ class RQMC_Fou_NIG_qpc(CommonLossFunctionAbs):
         - h: 2D loss interaction component.
         - l: 2D gradient interaction component (derivative of h contribution).
         - hess_1D / hess_2D: Hessian-related Fourier components.
+        - hess_2D_boundary : Boundary correction term for 2D hessian
 
         Parameters:
          - v_mu: Location vector.
@@ -215,12 +213,13 @@ class RQMC_Fou_NIG_qpc(CommonLossFunctionAbs):
         self._epsilon = epsilon
 
 
+
         if self._alpha_nig <= 0:
-            raise ValueError("alpha must be positive for NIG distribution")
+            raise ValueError("alpha must be positive for MNIG distribution")
         self._beta_nig = np.array(v_beta)
         self._delta_nig = v_delta
         if self._delta_nig <= 0:
-            raise ValueError("delta must be positive for NIG distribution")
+            raise ValueError("delta must be positive for MNIG distribution")
         self._N_current = int(N_sobol)
         self._m_shift = int(m_shift)
 
@@ -233,12 +232,13 @@ class RQMC_Fou_NIG_qpc(CommonLossFunctionAbs):
 
         if self._alpha_nig**2 <= self._quad_form:
             raise ValueError(
-                "alpha^2 must exceed beta^T Sigma beta for a valid NIG distribution"
+                "alpha^2 must exceed beta^T Sigma beta for a valid MNIG distribution"
             )
         self._gamma_nig = np.sqrt(self._alpha_nig**2 - self._quad_form)
 
-        
+    
         self._mu_nig = self._v_mu - self._delta_sig_beta / self._gamma_nig
+
 
         d = len(self._v_mu)
 
@@ -277,6 +277,7 @@ class RQMC_Fou_NIG_qpc(CommonLossFunctionAbs):
             for loss in ("h","l","hess_2D")
         }
 
+
         self._history_2d = {
             "h": {
                 (i, j): {"K": []}
@@ -290,9 +291,13 @@ class RQMC_Fou_NIG_qpc(CommonLossFunctionAbs):
             },
         }
         self._var_per_comp = []
+        self._cache_1d_K = {}
+        self._cache_2d_K = {}
         self._cache_2d_val = {}   # (i, j, tuple(m)) → float
         self._cache_2d_V_list = {}
         
+        
+
         self._sobol_1d_cache = {}
         self._sobol_2d_cache = {}
 
@@ -327,9 +332,10 @@ class RQMC_Fou_NIG_qpc(CommonLossFunctionAbs):
 
                 # store reversed view
                 self._sigma_trans_2D[(j, i)] = mat[np.ix_(swap, swap)]
-                self._L_2D[(j, i)] = chol[np.ix_(swap, swap)]
-       
-    
+                self._L_2D[(j, i)] = np.linalg.cholesky(
+                    self._sigma_trans_2D[(j, i)]
+                )
+
         self._jac_components = []          # holds per‐shift samples for baseline + CV increments
 
 
@@ -353,7 +359,9 @@ class RQMC_Fou_NIG_qpc(CommonLossFunctionAbs):
                     rec = self._history_2d[loss_name][key]
                     rec["K"].append(-self._last_K2[loss_name][key])
 
+
     # QMC sequence by dimension (1D/2D) for component integrands.
+
 
     def _get_cached_sobol(self, N, m, multi_dim=False, seed_start=None):
         """Return array shape (m, N, dim) using independent base-2 digital shifts.
@@ -421,6 +429,8 @@ class RQMC_Fou_NIG_qpc(CommonLossFunctionAbs):
     def _loss_grad_hess_by_name(self, name, K, idx1=None, idx2=None):
         """Dispatch to the loss/barrier value-gradient-Hessian by component name."""
 
+        d = len(self._v_mu)
+
         # 1D component family.
         if name in ("g", "f","hess_1D"):
             if idx1 is None:
@@ -432,6 +442,8 @@ class RQMC_Fou_NIG_qpc(CommonLossFunctionAbs):
         if name in ("h", "l","hess_2D"):
             if idx1 is None or idx2 is None:
                 raise ValueError(f"idx1 and idx2 must be provided for loss '{name}'")
+            i,j = (idx1,idx2) if idx1<idx2 else (idx2,idx1)
+
             val2,grad2, hess2 = getattr(self, f"_loss_{name}_grad_hess")(K)
             
             return val2,grad2, hess2
@@ -443,25 +455,25 @@ class RQMC_Fou_NIG_qpc(CommonLossFunctionAbs):
     # Adaptive damping selection for component integrands.
     # ---------------------------------------------------------------------------
     def _select_K(self, loss_name, m_curr, idx1=None, idx2=None):
-        """Select adaptive damping K for a 1D or 2D difference component family."""
 
+        """Select adaptive damping K for a 1D or 2D difference component family."""
         m_curr_1 = m_curr
+
         ## Penalizing parameter for boundary-hugging control
         lam_da = (100 * self._delta_nig)/self._gamma_nig # this approximate 0.1
-        
-        # 1D branch (warm start + constrained optimization).
 
+        # 1D branch (warm start + constrained optimization).
         if idx1 is not None and idx2 is None:
             i = idx1
             sigma_i_sc = self._v_sigma[i,i]
-            
+
             def F1_G1(K):
                 val_loss,grad_loss,_= self._loss_grad_hess_by_name(loss_name, K, i)
                 val_cf,grad_cf,_,_ = self._log_cf_grad_hess_1d(K,i)
                 F1 = val_loss+val_cf + lam_da/2 *(K**2)*sigma_i_sc-K*m_curr_1
                 G1 = (grad_loss+grad_cf)  + lam_da*K*sigma_i_sc-m_curr_1
                 return  F1,G1
-            
+
             eps = 0.01
 
             if self._last_K1[loss_name][i] is None:
@@ -469,13 +481,14 @@ class RQMC_Fou_NIG_qpc(CommonLossFunctionAbs):
                 self._last_K1[loss_name][i] = float(K0)
 
             def NIG_cons2(K):
+
                 # NIG constraint: alpha^2 > beta^T Sigma beta
                 _, _, _, DK = self._log_cf_grad_hess_1d(K, idx=i)
                 return DK - eps
 
             cons_K = {"type": "ineq", "fun": NIG_cons2}
 
-            
+
             x0 = self._last_K1[loss_name][i]
 
             bnds = Bounds([eps],[np.inf], keep_feasible=True)
@@ -488,8 +501,8 @@ class RQMC_Fou_NIG_qpc(CommonLossFunctionAbs):
                 bounds = bnds,
                 constraints=cons_K
             )
-            
-            K0 = float(res.x)
+
+            K0 = float(res.x.item())
 
             if NIG_cons2(K0) >= 0 and K0 >0:
                 pass
@@ -498,31 +511,33 @@ class RQMC_Fou_NIG_qpc(CommonLossFunctionAbs):
                 self._last_K1[loss_name][i] = K0
 
             return K0
+
         # 2D branch (pairwise component).
         if idx1 is not None and idx2 is not None:
             i, j = (idx1, idx2) if idx1 < idx2 else (idx2, idx1)
             sigma_2d = self._v_sigma[np.ix_([i, j], [i, j])]
-                        
+
             def F2_G2(K_vec):
                 val_loss,grad_loss,_ = self._loss_grad_hess_by_name(loss_name, K_vec, idx1=i,idx2=j)
                 val_cf,grad_cf,_,_ = self._log_cf_grad_hess_2d(K_vec,idx1= i,  idx2 = j)
                 F2 = val_loss+val_cf + lam_da/2 * float(np.dot(K_vec, sigma_2d @ K_vec))-K_vec.T.dot(m_curr_1)
                 G2 = grad_loss+ grad_cf + lam_da*sigma_2d @ K_vec-m_curr_1
                 return  F2,G2
-            
-            
+
+
             if self._last_K2[loss_name][(i, j)] is None:
 
                 K0_vec = np.ones(2)
                 self._last_K2[loss_name][(i, j)] = K0_vec.copy()
-            
+
             eps = 0.01
 
             def NIG_cons2(K):
+
                 # NIG constraint: alpha^2 > beta^T Sigma beta
                 _, _, _, D_pair = self._log_cf_grad_hess_2d(K, idx1=i, idx2=j)
                 return D_pair - eps
-            
+
             cons_K = [{"type": "ineq", "fun": NIG_cons2}]
 
 
@@ -539,6 +554,7 @@ class RQMC_Fou_NIG_qpc(CommonLossFunctionAbs):
             )
 
             K0_vec = res.x.copy()
+
             # 8) Feasibility check
             if (np.all(K0_vec > 0)) and (NIG_cons2(K0_vec) >= 0):
                 pass
@@ -546,9 +562,12 @@ class RQMC_Fou_NIG_qpc(CommonLossFunctionAbs):
                 K0_vec = x0_vec
 
             return K0_vec
+
+
     # ---------------------------------------------------------------------------
     # Log-transformed loss and CF terms used in damping optimization.
     # ---------------------------------------------------------------------------
+
 
     def _log_cf_grad_hess_1d(self, K_scalar, idx):
         
@@ -758,12 +777,10 @@ class RQMC_Fou_NIG_qpc(CommonLossFunctionAbs):
         
         i = 1j
         
-        z = (
-            K - i * u
-        )
+        
         ui_K = u + i * K
 
-        phase = np.exp(-z * m_val)
+        phase = np.exp(1j * u * m_val)
         cf =  self.char_function_vec(ui_K, idx)
         
         return phase * cf / (i * ui_K**3)
@@ -772,11 +789,10 @@ class RQMC_Fou_NIG_qpc(CommonLossFunctionAbs):
         """Integrand for 1D loss gradient component f."""
         
         i = 1j
-        z = (
-            K - i * u
-        )  
+       
         ui_K = u + i * K
-        phase = np.exp(-z * m_val)
+        phase = np.exp(1j * u * m_val)
+
         cf =  self.char_function_vec(ui_K, idx)
 
         return phase * cf / (ui_K**2)
@@ -785,11 +801,10 @@ class RQMC_Fou_NIG_qpc(CommonLossFunctionAbs):
         """Integrand for 1D hessian component."""
         
         i = 1j
-        z = (
-            K - i * u
-        ) 
+       
         ui_K = u + i * K
-        phase = np.exp(-z * m_val)
+        phase  = np.exp(1j * u * m_val)
+
         cf =  self.char_function_vec(ui_K, idx)
 
         return phase * cf / (i* ui_K)
@@ -814,7 +829,7 @@ class RQMC_Fou_NIG_qpc(CommonLossFunctionAbs):
         elif loss_name == "hess_1D":
             coef = self._coeff_f 
 
-        
+
         integrand = getattr(self, f"{loss_name}_fourier_integrand_vec")
      
         
@@ -825,12 +840,14 @@ class RQMC_Fou_NIG_qpc(CommonLossFunctionAbs):
 
         K_new = self._select_K(loss_name, m_val, idx1=idx)
 
-        
+
         qmc_seq_1D = self._get_cached_sobol(
             self._N_current,
             self._m_shift,
             seed_start= 0
         )
+
+
 
         est, V_list_1D = RQMC_Fourier_1D_MNIG_vec(
             K_new, idx,
@@ -841,8 +858,9 @@ class RQMC_Fou_NIG_qpc(CommonLossFunctionAbs):
             qmc_seq= qmc_seq_1D
         )
 
-        val = coef*est
-        V_list_1D = V_list_1D * coef
+
+        val = coef*est * np.exp(-K_new * m_val)
+        V_list_1D = V_list_1D * coef* np.exp(-K_new * m_val)
 
         if loss_name == "hess_1D":
             return val
@@ -852,6 +870,8 @@ class RQMC_Fou_NIG_qpc(CommonLossFunctionAbs):
         self._cache_1d_V_list[key_1D] = V_list_1D
 
         return val,V_list_1D
+
+
     
     # 2D components
     def h_fourier_integrand_vec(self, u, v, idx1, idx2, x, y, K):
@@ -860,11 +880,11 @@ class RQMC_Fou_NIG_qpc(CommonLossFunctionAbs):
         i = 1j
         ui_K0 = u + i * K[0]
         ui_K1 = v + i * K[1]
-        z0 = (K[0] - i * u)
-        z1 = (K[1] - i * v)
         
-        phase = np.exp(-z0 * x - z1 * y)
-        
+
+        phase = np.exp(1j * (u*x + v*y))
+
+
         cf = self.char_function_vec(np.stack([ui_K0, ui_K1], axis=-1), idx1, idx2)
         
         return phase * cf / (ui_K0**2 * ui_K1**2)
@@ -875,40 +895,52 @@ class RQMC_Fou_NIG_qpc(CommonLossFunctionAbs):
 
         i = 1j
         ui_K0 = u + i * K[0]
-        ui_K1 = v + i * K[1]
-        z0 = (K[0] - i * u)
-        z1 = (K[1] - i * v)
+        ui_K1 = v + i * K[1]        
+
         
 
-        phase = np.exp(-z0 * x - z1 * y)
-        
+        phase = np.exp(1j * (u*x + v*y))
+
         cf = self.char_function_vec(np.stack([ui_K0, ui_K1], axis=-1), idx1, idx2)
         
         return phase * cf / (i * ui_K0**2 * ui_K1)
     
     def hess_2D_fourier_integrand_vec(self, u, v, idx1, idx2, x, y, K):
         """Integrand for 2D Hessian helper component."""
+
         i = 1j
         ui_K0 = u + i * K[0]
         ui_K1 = v + i * K[1]
-        z0 = (K[0] - i * u)
-        z1 = (K[1] - i * v)
         
-        phase = np.exp(-z0 * x - z1 * y)
         
+
+        phase = np.exp(1j * (u*x + v*y))
+
         cf = self.char_function_vec(np.stack([ui_K0, ui_K1], axis=-1), idx1, idx2)
         
         return phase * cf / (ui_K0 * ui_K1)
     
     
+    def hess_2D_boundary_fourier_integrand_vec(self,u,v,idx1,idx2,x,y,K):
+        """Intergrand for the boundary correction term"""
+        i = 1j
+        ui_K0 = u + i*K[0]
+        phase = np.exp(i*u*x + i*v*y)
+
+        cf = self.char_function_vec(np.stack([ui_K0, v], axis=-1), idx1, idx2)
+
+        return phase * cf /(ui_K0 **2)
+
+
     def _compute_2d(self, loss_name, i, j, m_val):
         """
         Compute one 2D component family for pair (i, j).
 
-        loss_name in {"h", "l", "hess_2D"}:
+        loss_name in {"h", "l", "hess_2D","hess_2D_boundary"}:
         - h: 2D loss component
         - l: 2D gradient component
         - hess_2D: 2D Hessian helper
+        - hess_2D_boundary: 2D Hessian for boundary correction term 
         """
         
         m_val_2D = m_val[[i,j]]
@@ -917,6 +949,8 @@ class RQMC_Fou_NIG_qpc(CommonLossFunctionAbs):
 
        
         key_2D = (loss_name,key,tuple(m_val_2D))
+        key_damp_2d = (loss_name,key)
+
         integrand = getattr(self, f"{loss_name}_fourier_integrand_vec")
         
         coef    = self._coeff_hl        
@@ -925,11 +959,17 @@ class RQMC_Fou_NIG_qpc(CommonLossFunctionAbs):
             return self._cache_2d_val[key_2D],self._cache_2d_V_list[key_2D]
         
         
+          
         key_qmc = key_sort
-        
+
+        if loss_name == 'hess_2D_boundary':
+            indic_K = 'hess_2D'
+        else:
+            indic_K = loss_name
+
         # Select damping for current step.
 
-        K_new = self._select_K(loss_name, m_val_2D, idx1=i, idx2=j)
+        K_new = self._select_K(loss_name = indic_K, m_curr = m_val_2D, idx1=i, idx2=j)
 
         qmc_seq_2D = self._get_cached_sobol(
             self._N_current,
@@ -937,6 +977,8 @@ class RQMC_Fou_NIG_qpc(CommonLossFunctionAbs):
             multi_dim=True,
             seed_start=0
         )
+
+
 
         est, V_list_2D = RQMC_Fourier_2D_MNIG_vec(
             K_new, i, j,
@@ -947,14 +989,22 @@ class RQMC_Fou_NIG_qpc(CommonLossFunctionAbs):
             integrand_func=integrand,
             qmc_seq_2D= qmc_seq_2D
         )
-        
-        val_2D = coef  * est
-        V_list_2D = V_list_2D * coef
+        sum_Km = K_new.T @ m_val_2D
 
+        val_2D = np.exp(-sum_Km)*coef * est
+        V_list_2D = np.exp(-sum_Km) * coef * V_list_2D
+
+        
         if loss_name == "hess_2D":
             return val_2D
 
+        if loss_name == 'hess_2D_boundary':
+            Km_first = K_new[0]*m_val_2D[0]
+            val_bound_2d = np.exp(-Km_first) * coef * est
+            return val_bound_2d
+
         self._last_K2[loss_name][key_sort]   = K_new if i<j else K_new[::-1]
+
         self._cache_2d_val[key_2D] = val_2D
         self._cache_2d_V_list[key_2D] = V_list_2D
         
@@ -966,7 +1016,7 @@ class RQMC_Fou_NIG_qpc(CommonLossFunctionAbs):
     # ============================================================================
     # Loss aggregation: E[l(X - m)] from 1D and 2D components.
 
-    def shortfall_risk(self, m):
+    def loss_derivative_samples(self, m):
         m = self._check_argument(m)
 
         self._current_m = m.copy()
@@ -974,6 +1024,42 @@ class RQMC_Fou_NIG_qpc(CommonLossFunctionAbs):
 
         
         
+        objective_samples = np.full(
+            self._m_shift, self.e(m), dtype=float
+        )
+
+
+        gradient_samples = np.ones(
+            (self._m_shift, d), dtype=float
+        )
+        for i in range(d):
+            _, vec_g = self._compute_1d('g', i, m[i])
+            _, vec_f = self._compute_1d('f', i, m[i])
+
+            objective_samples += 0.5 * vec_g
+            gradient_samples[:, i] += vec_f
+
+            if self._alpha:
+                for j in range(d):
+                    if j != i:
+                        _, vec_l = self._compute_2d('l', j, i, m)
+                        gradient_samples[:, i] += self._alpha * vec_l
+
+        if self._alpha:
+            for i in range(d):
+                for j in range(i + 1, d):
+                    _, vec_h = self._compute_2d('h', i, j, m)
+                    objective_samples += self._alpha * vec_h
+
+        return objective_samples, gradient_samples
+
+
+    def shortfall_risk(self, m):
+        m = self._check_argument(m)
+
+        self._current_m = m.copy()
+        d = len(m)
+
         e = self.e(m)
         g = sum(self._compute_1d('g', i, m[i])[0] for i in range(d))
         h = 0.0
@@ -981,6 +1067,8 @@ class RQMC_Fou_NIG_qpc(CommonLossFunctionAbs):
             h = sum(self._compute_2d('h', i, j,m)[0]
                     for i in range(d) for j in range(i+1, d))
         return e + 0.5*g + (self._alpha * h)
+
+
         
     # Loss gradient aggregation: E[∇l(X - m)] from 1D and 2D components
 
@@ -1005,60 +1093,112 @@ class RQMC_Fou_NIG_qpc(CommonLossFunctionAbs):
                         jac[i] += self._alpha * val_l
                         samples_jac[:,i] += self._alpha * vec_l
 
-        self._pending_jac = samples_jac              
+        self._pending_jac = samples_jac
         return jac
-        
+
+
     # ============================================================================
     # Statistical error components
     # ============================================================================
-    # Gradient-variance component of sandwich covariance V.
-    def shortfall_risk_jac_var(self,per_comp = False):
-        """Return covariance estimate of Jacobian RQMC samples."""
-        comps = self._jac_components
-        if not comps:
-            raise RuntimeError("shortfall_risk_jac_var called before any gradient components were recorded")
-               
-        self._var_per_comp = [np.cov(comp, rowvar=False, ddof=1) for comp in comps]
 
-        if per_comp:
-            return self._var_per_comp
-       
-        return self._var_per_comp[-1]
-    
-    # Inverse Hessian component of sandwich covariance V.
-    def shortfall_risk_hess_inv(self, m):
+    def mean_loss_hessian(self, m):
+        """Estimate E[Hessian l(X-m)], shape (d, d)."""
+        m = self._check_argument(m)
+        self._current_m = m.copy()
         d = len(m)
-    
-        hess = np.zeros((d, d), dtype=float)
-        for i in range(d):
-            hess[i, i] = self._compute_1d('hess_1D',i, m[i])
-            for j in range(d):
-                if j != i:
-                    hess[i, j] = self._alpha * self._compute_2d('hess_2D',j, i, m)
 
-        hess_inv = np.linalg.inv(hess)
+        hessian = np.zeros((d, d), dtype=float)
+
+        for i in range(d):
+            val= self._compute_1d('hess_1D', i, m[i])
+            hessian[i, i] = val
+
+            if self._alpha:
+                for j in range(d):
+                    if j == i:
+                        continue
+
+                    val_cross = self._compute_2d(
+                        'hess_2D', j, i, m
+                    )
+                    hessian[i, j] = -self._alpha * val_cross
+
+
+                    val_boundary = self._compute_2d(
+                        'hess_2D_boundary', j, i, m
+                    )
+                    hessian[i, i] -= self._alpha * val_boundary
+
+        return hessian
+
+
+    def gradient_oracle(self, loss_samples, gradient_samples, lam):
+        """One oracle vector per randomized shift: shape (S, d+1)."""
+        n_shifts, d = gradient_samples.shape
+
+        oracle_samples = np.empty((n_shifts, d + 1), dtype=float)
+
+        oracle_samples[:, :d] = 1.0 - lam * gradient_samples
+        oracle_samples[:, -1] = loss_samples - self.c
+
+        return oracle_samples
+
+
+    def jacobian_oracle(self, m, lam, mean_gradient):
+        """Mean oracle Jacobian with respect to (m, lambda)."""
+        d = len(m)
+        mean_hessian = self.mean_loss_hessian(m)
+
+        jacobian = np.zeros((d + 1, d + 1), dtype=float)
+
+        jacobian[:d, :d] = lam * mean_hessian
+        jacobian[:d, -1] = -mean_gradient
+        jacobian[-1, :d] = -mean_gradient
+
+        return jacobian
+
+
+    def stat_err_full(self, m, lam, alpha_conf=0.05):
+        """Marginal confidence half-widths for the allocation components."""
+        m = self._check_argument(m)
+        d = len(m)
+
+
+        loss_samples, gradient_samples = self.loss_derivative_samples(m)
+        n_shifts = gradient_samples.shape[0]
+
+        if n_shifts < 2:
+            raise ValueError("At least two randomized shifts are required.")
+
+        oracle_samples = self.gradient_oracle(
+            loss_samples, gradient_samples, lam
+        )
+
+
+        mean_gradient = gradient_samples.mean(axis=0)
+        mean_jacobian = self.jacobian_oracle(
+            m, lam, mean_gradient
+        )
+
+
+        oracle_covariance = np.cov(
+            oracle_samples, rowvar=False, ddof=1
+        )
+
+
+        left = np.linalg.solve(mean_jacobian, oracle_covariance)
+        sandwich = np.linalg.solve(mean_jacobian, left.T).T
+
+
+        estimator_covariance = sandwich / n_shifts
+
+        critical_value = norm.ppf(1.0 - alpha_conf / 2.0)
+        stat_errors = critical_value * np.sqrt(
+            np.diag(estimator_covariance)
+        )
+
+        return float(stat_errors.max())
+
+
         
-
-        return hess_inv
     
-    # Maximum diagonal-based CI radius for the solution estimate.
-
-    def statistical_error_sol_RQMC(self, m, alpha_conf=0.05):
-        """Return max coordinate-wise confidence radius for the solution."""
-
-        d = len(m)
-        var_jac = self.shortfall_risk_jac_var()
-        inv_H = self.shortfall_risk_hess_inv(m)
-        var_sol = inv_H @ var_jac @ inv_H 
-
-        C_alpha = norm.ppf(1 - alpha_conf / 2)
-
-        RQMC_stat_error = []
-
-        for i in range(d):
-            std_i = np.sqrt(var_sol[i, i])
-            rqmc_err = C_alpha * std_i / np.sqrt(self._m_shift)
-            RQMC_stat_error.append(rqmc_err)
-
-        return np.nanmax(RQMC_stat_error)
-#     

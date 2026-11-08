@@ -168,18 +168,20 @@ class RQMC_Fou_MN_expo(CommonLossFunctionAbs):
         swap = np.array([1, 0])
 
         for i in range(d):
-            for j in range(i + 1, d):
-                # build canonical block once
-                mat = self._rescale_cov(self._v_sigma[np.ix_([i, j], [i, j])])
-                chol = np.linalg.cholesky(mat)
+                for j in range(i + 1, d):
+                    # build canonical block once
+                    mat = self._rescale_cov(self._v_sigma[np.ix_([i, j], [i, j])])
+                    chol = np.linalg.cholesky(mat)
 
-                # store canonical key
-                self._sigma_trans_2D[(i, j)] = mat
-                self._L_2D[(i, j)] = chol
+                    # store canonical key
+                    self._sigma_trans_2D[(i, j)] = mat
+                    self._L_2D[(i, j)] = chol
 
-                # store reversed view
-                self._sigma_trans_2D[(j, i)] = mat[np.ix_(swap, swap)]
-                self._L_2D[(j, i)] = chol[np.ix_(swap, swap)]
+                    # Factor the reversed covariance to preserve lower triangularity.
+                    self._sigma_trans_2D[(j, i)] = mat[np.ix_(swap, swap)]
+                    self._L_2D[(j, i)] = np.linalg.cholesky(
+                        self._sigma_trans_2D[(j, i)]
+                    )
         
         self._jac_components = []  # Holds per-shift samples for variance estimation.
 
@@ -311,7 +313,7 @@ class RQMC_Fou_MN_expo(CommonLossFunctionAbs):
         res = minimize(fun=F1, x0=x0, method="SLSQP", jac=G1, bounds=bnds)
        
 
-        K_sol = float(res.x)
+        K_sol = float(res.x[0])
         ok_1d = (K_sol > self._v_beta) if side1d else (K_sol < self._v_beta)
         # Feasibility guard (stick to side; if not, keep previous x0)
         if not ok_1d:
@@ -491,9 +493,10 @@ class RQMC_Fou_MN_expo(CommonLossFunctionAbs):
 
     # 1D component integrands.
     def g_fourier_integrand(self, u, idx, m_val, K, positive_sign=True):
+        """Integrand for g-term (one side)."""
         i = 1j
         ui_K = u + i * K
-        phase = np.exp(-(K - i*u) * m_val)    # exp(-K m) * exp(-i u m)
+        phase = np.exp(i*u * m_val)    # exp(-K m) * exp(-i u m)
         cf = self.char_function(ui_K, idx)
 
 
@@ -536,14 +539,16 @@ class RQMC_Fou_MN_expo(CommonLossFunctionAbs):
             integrand_func=integrand_1D,
             qmc_seq=qmc_seq_1D,
         )
+        val_1D = np.exp(-K_1D *m_val)*coef * est
+        V_list_1D =  np.exp(-K_1D *m_val)* coef * V_list
+
         self._last_K1[(idx, bool(sign))] = K_1D
-        val = coef * est
-        V_list = V_list * coef
+        
 
-        self._cache_1d_val[key] = val
-        self._cache_1d_V_list[key] = V_list
+        self._cache_1d_val[key] = val_1D
+        self._cache_1d_V_list[key] = V_list_1D
 
-        return val, V_list
+        return val_1D, V_list_1D
 
     def _compute_1d_2side(self, idx, m_val):
         """Sum both 1D sides and aggregate per-shift samples."""
@@ -576,7 +581,7 @@ class RQMC_Fou_MN_expo(CommonLossFunctionAbs):
         ui_K1 = v + i * Ky
 
         # Phase term: exp(-(Kx - i u) x - (Ky - i v) y)
-        phase = np.exp(-(Kx - i*u) * x - (Ky - i*v) * y)
+        phase = np.exp(i*u * x + i*v * y)
 
         # Characteristic function
         tij = np.stack([ui_K0, ui_K1], axis=-1)        
@@ -644,23 +649,25 @@ class RQMC_Fou_MN_expo(CommonLossFunctionAbs):
             integrand_func=integrand_func_2D,
             qmc_seq_2D=qmc_seq_2D,
         )
+        sum_Km = K_2D.T @ m_val_2D
+        val_2D =  np.exp(-sum_Km)*coef * est
+        V_list_2D = np.exp(-sum_Km)*coef * V_list
 
         key_hist = (min(i, j), max(i, j), bool(sign2d[0]), bool(sign2d[1]))
         self._last_K2[key_hist] = K_2D
     
-        val_2D = coef * est
-        V_list = V_list * coef
+        
         self._cache_2d_val[key] = val_2D
-        self._cache_2d_V_list[key] = V_list
+        self._cache_2d_V_list[key] = V_list_2D
 
-        return val_2D, V_list
+        return val_2D, V_list_2D
 
     def _compute_2d_2side(self, i, j, m_val):
         """Aggregate all four 2D sign combinations."""
         val_pos_11, V11 = self._compute_2d(i, j, m_val, sign2d=(True, True))
         val_pos_12, V12 = self._compute_2d(i, j, m_val, sign2d=(True, False))
         val_neg_11, V22 = self._compute_2d(i, j, m_val, sign2d=(False, False))
-        val_neg_12, V21 = self._compute_2d(i, j, m_val, sign2d=(True, False))
+        val_neg_12, V21 = self._compute_2d(i, j, m_val, sign2d=(False, True))
         val_tol = val_pos_11 + val_pos_12 + val_neg_11 + val_neg_12
         V_tol = V11 + V12 + V22 + V21
         return val_tol, V_tol
@@ -669,105 +676,155 @@ class RQMC_Fou_MN_expo(CommonLossFunctionAbs):
     # Aggregation all the Fourier components
     # ============================================================================
     # Loss aggregation: E[l(X - m)] from 1D and 2D components.
-    def shortfall_risk(self, m):
+    def loss_derivative_samples(self, m):
         m = self._check_argument(m)
+        self._current_m = m.copy()
 
         d = len(m)
 
-       
-        g = sum(self._compute_1d_2side(i, m[i])[0] for i in range(d))
-        h = 0.0
-        if self._alpha:
-            h = sum(
-                self._compute_2d_2side(i, j, m)[0]
-                for i in range(d)
-                for j in range(i + 1, d)
-            )
-        return self._1_alpha * (g + (self._alpha * h))        
-    
-    # Loss gradient aggregation: E[∇l(X - m)] from 1D and 2D components.
-    def shortfall_risk_jac(self, m):
-        m = self._check_argument(m)
-
-        d = len(m)
-
-        jac = np.zeros_like(m, dtype=float)
-        samples_jac = np.zeros((self._m_shift, d), dtype=float)
+        loss_samples = np.zeros(self._m_shift, dtype=float)
+        gradient_samples = np.zeros(
+            (self._m_shift, d), dtype=float
+        )
 
         for i in range(d):
-                val,vec = self._compute_1d_2side(i, m[i])
-                jac[i] = val
-                samples_jac[:,i] = vec
-                if self._alpha:
-                    for j in range(d):
-                        if j != i:
-                            val_l,vec_l = self._compute_2d_2side(j, i, m)
-                            jac[i] += self._alpha * val_l
-                            samples_jac[:,i] += self._alpha * vec_l
-                        
-        samples_jac *= self._1_alpha * self._v_beta
-        
-        self._pending_jac = samples_jac              
+            _, vec = self._compute_1d_2side(i, m[i])
+
+            loss_samples += vec
+            gradient_samples[:, i] += vec
+
+            if self._alpha:
+                for j in range(d):
+                    if j != i:
+                        _, vec_l = self._compute_2d_2side(j, i, m)
+                        gradient_samples[:, i] += (
+                            self._alpha * vec_l
+                        )
+
+        if self._alpha:
+            for i in range(d):
+                for j in range(i + 1, d):
+                    _, vec_h = self._compute_2d_2side(i, j, m)
+                    loss_samples += self._alpha * vec_h
+
+        loss_samples *= self._1_alpha
+        gradient_samples *= self._1_alpha * self._v_beta
+
+        return loss_samples, gradient_samples
+    def shortfall_risk(self, m):
+        loss_samples, _ = self.loss_derivative_samples(m)
+        return float(loss_samples.mean())
+
+    def shortfall_risk_jac(self, m):
+        _, gradient_samples = self.loss_derivative_samples(m)
+
+        self._pending_jac = gradient_samples.copy()
+
+        return gradient_samples.mean(axis=0)
 
     
-        return self._1_alpha * self._v_beta * jac
     
     # ============================================================================
     # Statistical error components
     # ============================================================================
 
     # Gradient-variance component of sandwich covariance V.
-    def shortfall_risk_jac_var(self):
-        comps = self._jac_components
-        if not comps:
-            raise RuntimeError("shortfall_risk_jac_var called before any gradient components were recorded")
-
-                
-        self._var_per_comp = [np.cov(comp, rowvar=False, ddof=1) for comp in comps]
-        return self._var_per_comp[-1]
+   
     
-    # Inverse Hessian component of sandwich covariance V.
-    def shortfall_risk_hess_inv(self, m):
+    def mean_loss_hessian(self, m):
+        m = self._check_argument(m)
+        self._current_m = m.copy()
+
         d = len(m)
+
         const_1 = self._1_alpha * self._v_beta**2
-        const_2 = self._alpha * self._v_beta**2 * self._1_alpha
+        const_2 = self._alpha * const_1
 
-        hess = np.zeros((d, d), dtype=float)
-
-        global_comp = 0.0
-        for i in range(d):
-            for j in range(d):
-                if j == i:
-                    continue
-                global_comp += const_2 * self._compute_2d_2side(j, i, m)[0]
+        hessian = np.zeros((d, d), dtype=float)
 
         for i in range(d):
-            hess[i, i] = const_1 * self._compute_1d_2side(i, m[i])[0] + global_comp
-            for j in range(d):
-                if j != i:
-                    hess[i, j] = global_comp
-        hess_inv = np.linalg.inv(hess)
-        
-        return hess_inv
-    
-    # Maximum diagonal-based CI radius for the solution estimate.
-    def statistical_error_sol_RQMC(self, m, alpha_conf=0.05):
+            val, _ = self._compute_1d_2side(i, m[i])
+            hessian[i, i] = const_1 * val
+
+        if self._alpha:
+            for i in range(d):
+                for j in range(i + 1, d):
+                    val, _ = self._compute_2d_2side(i, j, m)
+                    contribution = const_2 * val
+
+                    hessian[i, i] += contribution
+                    hessian[j, j] += contribution
+
+                    hessian[i, j] = contribution
+                    hessian[j, i] = contribution
+
+        return hessian
+
+
+    def gradient_oracle(self, loss_samples, gradient_samples, lam):
+            """One oracle vector per randomized shift: shape (S, d+1)."""
+            n_shifts, d = gradient_samples.shape
+
+            oracle_samples = np.empty((n_shifts, d + 1), dtype=float)
+
+            oracle_samples[:, :d] = 1.0 - lam * gradient_samples
+            oracle_samples[:, -1] = loss_samples - self.c
+
+            return oracle_samples
+
+    def jacobian_oracle(self, m, lam, mean_gradient):
+        """Mean oracle Jacobian with respect to (m, lambda)."""
         d = len(m)
-        var_jac = self.shortfall_risk_jac_var()
-        inv_H = self.shortfall_risk_hess_inv(m)
-        var_sol = inv_H @ var_jac @ inv_H 
+        mean_hessian = self.mean_loss_hessian(m)
 
-        C_alpha = norm.ppf(1 - alpha_conf / 2)
+        jacobian = np.zeros((d + 1, d + 1), dtype=float)
 
-        RQMC_stat_error = []
+        jacobian[:d, :d] = lam * mean_hessian
+        jacobian[:d, -1] = -mean_gradient
+        jacobian[-1, :d] = -mean_gradient
 
-        for i in range(d):
-            std_i = np.sqrt(var_sol[i, i])
-            rqmc_err = C_alpha * std_i / np.sqrt(self._m_shift)
-            RQMC_stat_error.append(rqmc_err)
+        return jacobian
 
-        return np.max(RQMC_stat_error)
+    def stat_err_full(self, m, lam, alpha_conf=0.05):
+        """Marginal confidence half-widths for the allocation components."""
+        m = self._check_argument(m)
+        d = len(m)
 
+        # Compute the shift estimates once.
+        loss_samples, gradient_samples = self.loss_derivative_samples(m)
+        n_shifts = gradient_samples.shape[0]
+
+        if n_shifts < 2:
+            raise ValueError("At least two randomized shifts are required.")
+
+        oracle_samples = self.gradient_oracle(
+            loss_samples, gradient_samples, lam
+        )
+
+        # Only the mean gradient and mean Hessian enter the Jacobian.
+        mean_gradient = gradient_samples.mean(axis=0)
+        mean_jacobian = self.jacobian_oracle(
+            m, lam, mean_gradient
+        )
+
+        # Covariance between oracle components across independent shifts.
+        oracle_covariance = np.cov(
+            oracle_samples, rowvar=False, ddof=1
+        )
+
+        # A^{-1} B A^{-T}, using linear solves.
+        left = np.linalg.solve(mean_jacobian, oracle_covariance)
+        sandwich = np.linalg.solve(mean_jacobian, left.T).T
+
+        # Covariance of the estimator averaged over shifts.
+        estimator_covariance = sandwich / n_shifts
+
+        critical_value = norm.ppf(1.0 - alpha_conf / 2.0)
+        stat_errors = critical_value * np.sqrt(
+            np.diag(estimator_covariance)
+        )
+
+        return float(stat_errors.max())
         
 # ============================================================================
 # End of module
